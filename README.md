@@ -33,9 +33,9 @@ Stop relying on outdated package managers or checking websites manually. Updaini
 
 ## Screenshots
 
-| <img src="./static/1.png" alt="Apps Page" /> | <img src="./static/2.png" alt="App Page" />           |
+| <picture><source srcset="./static/1-dark.png" media="(prefers-color-scheme: dark)" /> <img src="./static/1.png" alt="Apps Page" /></picture> | <picture><source srcset="./static/2-dark.png" media="(prefers-color-scheme: dark)" /> <img src="./static/2.png" alt="App Page" /></picture>           |
 | ------------------------------------------------------ | ----------------------------------------------------------------------- |
-| <img src="./static/3.png" alt="Add App Page" /> | <img src="./static/4.png" alt="Settings Page" />  |
+| <picture><source srcset="./static/3-dark.png" media="(prefers-color-scheme: dark)" /> <img src="./static/3.png" alt="Add App Page" /></picture> | <picture><source srcset="./static/4-dark.png" media="(prefers-color-scheme: dark)" /> <img src="./static/4.png" alt="Settings Page" /></picture> |
 
 ---
 
