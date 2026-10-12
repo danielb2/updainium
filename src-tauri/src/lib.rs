@@ -1,11 +1,13 @@
 use std::{fs, io::Write, process::Command};
 use sha2::{Digest, Sha256};
 use tauri::{
-    menu::{Menu, MenuItem, Submenu},
+    menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager,
 };
 use tauri_plugin_autostart::MacosLauncher;
+#[cfg(not(target_os = "macos"))]
+use tauri::menu::Submenu;
 
 #[derive(serde::Serialize)]
 struct Platform {
@@ -41,8 +43,20 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
         .setup(|app| {
-            let app_menu = Submenu::new(app, "Updainium", true)?;
-            app.set_menu(Menu::with_items(app, &[&app_menu])?)?;
+            #[cfg(target_os = "macos")]
+            {
+                // Native editing and quit shortcuts require their menu actions on macOS.
+                let menu = Menu::default(app.handle())?;
+                if let Some(app_menu) = menu.items()?.first().and_then(|item| item.as_submenu()) {
+                    app_menu.set_text("Updainium")?;
+                }
+                app.set_menu(menu)?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let app_menu = Submenu::new(app, "Updainium", true)?;
+                app.set_menu(Menu::with_items(app, &[&app_menu])?)?;
+            }
 
             let open = MenuItem::with_id(app, "open", "Open Updainium", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
