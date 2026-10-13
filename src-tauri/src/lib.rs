@@ -1,11 +1,15 @@
 use std::{fs, io::Write, process::Command};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use sha2::{Digest, Sha256};
 use tauri::{
-    menu::{Menu, MenuItem, Submenu},
+    menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager,
 };
 use tauri_plugin_autostart::MacosLauncher;
+#[cfg(not(target_os = "macos"))]
+use tauri::menu::Submenu;
 
 #[derive(serde::Serialize)]
 struct Platform {
@@ -41,8 +45,19 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
         .setup(|app| {
-            let app_menu = Submenu::new(app, "Updainium", true)?;
-            app.set_menu(Menu::with_items(app, &[&app_menu])?)?;
+            #[cfg(target_os = "macos")]
+            {
+                let menu = Menu::default(app.handle())?;
+                if let Some(app_menu) = menu.items()?.first().and_then(|item| item.as_submenu()) {
+                    app_menu.set_text("Updainium")?;
+                }
+                app.set_menu(menu)?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let app_menu = Submenu::new(app, "Updainium", true)?;
+                app.set_menu(Menu::with_items(app, &[&app_menu])?)?;
+            }
 
             let open = MenuItem::with_id(app, "open", "Open Updainium", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -87,6 +102,8 @@ pub fn run() {
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.set_dock_visibility(true);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -139,9 +156,6 @@ fn sha256_field(value: &serde_json::Value) -> Option<String> {
         .then(|| digest.to_ascii_lowercase())
 }
 
-/// GitHub, Gitea and Forgejo expose assets as an array of objects using
-/// `browser_download_url`; GitLab nests them under `assets.links` and calls the
-/// download field `direct_asset_url`.
 fn normalize_release(payload: serde_json::Value) -> Release {
     let payload = match payload {
         serde_json::Value::Array(mut items) if !items.is_empty() => items.remove(0),
@@ -196,9 +210,6 @@ fn normalize_release(payload: serde_json::Value) -> Release {
     }
 }
 
-/// Fetches release metadata from the backend instead of the WebView: forge APIs
-/// do not send `Access-Control-Allow-Origin`, so a `fetch()` from the Tauri page
-/// is rejected by WebKit even when the server is reachable.
 #[tauri::command]
 async fn fetch_release_metadata(api_urls: Vec<String>) -> Result<Release, String> {
     if api_urls.is_empty() {
@@ -381,6 +392,7 @@ fn identify_windows_app_identifier_from_path(path: &std::path::Path) -> Result<S
     for root in roots {
         let output = Command::new("reg")
             .args(["query", root, "/s"])
+            .creation_flags(0x08000000)
             .output()
             .map_err(|error| error.to_string())?;
         let mut key = String::new();
@@ -569,6 +581,7 @@ fn identify_windows_app_identifier(app_name: &str) -> Result<Option<String>, Str
     for root in roots {
         let output = Command::new("reg")
             .args(["query", root, "/s", "/v", "DisplayName"])
+            .creation_flags(0x08000000)
             .output()
             .map_err(|error| error.to_string())?;
         let mut key = String::new();
@@ -732,6 +745,7 @@ fn installed_windows_version(identifier: &str) -> Result<Option<String>, String>
         let key = format!(r"{root}\{identifier}");
         let entry = Command::new("reg")
             .args(["query", &key])
+            .creation_flags(0x08000000)
             .output()
             .map_err(|error| error.to_string())?;
         if !entry.status.success() {
@@ -739,6 +753,7 @@ fn installed_windows_version(identifier: &str) -> Result<Option<String>, String>
         }
         let version = Command::new("reg")
             .args(["query", &key, "/v", "DisplayVersion"])
+            .creation_flags(0x08000000)
             .output()
             .map_err(|error| error.to_string())?;
         let value = String::from_utf8_lossy(&version.stdout)
