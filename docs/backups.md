@@ -27,7 +27,10 @@ in localStorage, sent to raw gist hosts, or included in JSON or gist exports.
 
 ## Gist migration
 
-After connecting, the app finds your existing Updainium backup gists. If there
+After connecting with a token, the app finds your existing Updainium backup gists.
+Opening Settings does not contact GitHub: it reuses the list loaded earlier in
+the current app session. After restarting the app, click **Load backups** to fetch
+the list; click **Refresh** when you want to check for remote changes. If there
 is only one, it becomes the main backup automatically. If there are several,
 choose the main backup once; the choice is remembered locally per GitHub account.
 Existing gists are never deleted or combined automatically.

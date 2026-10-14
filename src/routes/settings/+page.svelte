@@ -5,7 +5,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { createBackup, parseBackup, parseGistId, restoreSources, sourcesKey, type Backup } from "$lib/backup";
-  import { chooseMainBackup, mainBackupKey, type Gist, type GistRevision } from "$lib/gists";
+  import { cacheGists, clearCachedGists, readCachedGists, chooseMainBackup, mainBackupKey, type Gist, type GistRevision } from "$lib/gists";
 
   const backgroundKey = "updainium.background.v1";
   let backgroundEnabled = $state(false);
@@ -50,10 +50,15 @@
 
   onMount(() => {
     let disposed = false;
-    void invoke<{ login: string } | null>("github_status").then(async (account) => {
+    void invoke<{ login: string } | null>("github_status").then((account) => {
       if (disposed || !account) return;
       login = account.login;
-      await runGithub(loadGists);
+      const cached = readCachedGists(login);
+      if (cached !== undefined) {
+        gists = cached;
+        backupsLoaded = true;
+        selectMainBackup(chooseMainBackup(gists, localStorage.getItem(mainBackupKey(login))));
+      }
     }).catch((cause) => { if (!disposed) githubError = messageOf(cause); });
     return () => {
       disposed = true;
@@ -189,6 +194,7 @@
     const loaded = await invoke<Gist[]>("github_list_backups");
     if (attempt !== githubAttempt) return;
     gists = loaded;
+    cacheGists(login, loaded);
     backupsLoaded = true;
     const remembered = localStorage.getItem(mainBackupKey(login));
     selectMainBackup(chooseMainBackup(gists, remembered));
@@ -211,6 +217,7 @@
     const info = await invoke<{ gist: Gist; revision: string }>("github_backup_info", { id: selectedGist });
     if (attempt !== githubAttempt) return;
     gists = gists.map((gist) => gist.id === info.gist.id ? info.gist : gist);
+    cacheGists(login, gists);
     expectedRevision = info.revision;
     confirmUpload = true;
   }
@@ -240,6 +247,7 @@
 
   async function disconnect(): Promise<void> {
     await invoke("github_disconnect");
+    clearCachedGists(login);
     login = "";
     accessToken = "";
     gists = [];
