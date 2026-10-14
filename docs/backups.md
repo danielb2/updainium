@@ -27,23 +27,35 @@ in localStorage, sent to raw gist hosts, or included in JSON or gist exports.
 
 ## Gist migration
 
-After connecting, choose **Secret** or **Public** for a new backup, or select a
-previous backup to update it. Updates preserve the gist's existing visibility.
-Updating asks for confirmation before replacing the remote backup. Backups use
-secret gists by default: they are unlisted, but anyone with the link can read them.
-Public gists are visible to everyone and discoverable on GitHub. On the
-destination computer, sign in to the same account, select the backup, and choose
-**Restore selected backup**. The same local import preview and confirmation apply.
-Click **Open gist** to open the selected backup in your default browser, including
-immediately after creating or updating it.
-You can also enter a gist ID directly. To import someone else's catalog, paste a
-gist URL or ID under **Import from a shared gist**, without signing in. Shared
-imports default to keeping your startup preferences. Choose **Add to current apps**
-to merge, or **Clean and import** to replace the catalog after confirmation.
-Upload and restore are manual; the app does
-not automatically overwrite remote or local changes. Disconnecting removes the
-local session and saved credentials without deleting gists or revoking the token
-on GitHub.
+After connecting, the app finds your existing Updainium backup gists. If there
+is only one, it becomes the main backup automatically. If there are several,
+choose the main backup once; the choice is remembered locally per GitHub account.
+Existing gists are never deleted or combined automatically.
+
+With no existing backup, choose **Secret** or **Public** and click **Create backup**.
+With a main backup selected, **Update backup** becomes the primary action. Updates
+reuse the same gist, preserve its visibility, and retain older revisions in GitHub's
+history. Before confirmation, the app fetches the latest update time. Before
+uploading, it checks that the revision has not changed since that review; a newer
+revision asks you to refresh and review again. This checks for changes before the
+upload, but does not lock the remote gist against simultaneous writes.
+
+**Restore backup** loads revision history. Choose **Latest version** or a dated
+older revision and click **Preview restore**. The existing import preview lets you
+add missing apps or clean and replace the catalog, and optionally apply startup
+preferences. Restoring an older version only changes local data; it does not rewind
+the gist. **Open gist** opens the main backup in your default browser.
+
+**Create a separate backup** is an optional action for a different app collection.
+It becomes the main backup while the previous gist is kept. Secret gists are
+unlisted but anyone with their link can read them; public gists are visible to
+everyone and discoverable on GitHub.
+
+To import someone else's catalog, paste a gist URL or ID under **Import from a
+shared gist**, without signing in. Shared imports default to keeping your startup
+preferences. Upload and restore are manual. Disconnecting removes the local
+session and saved credentials without deleting gists or revoking the token on
+GitHub. All GitHub requests show a cancellable progress dialog.
 
 GitHub calls happen in the Rust backend to avoid WebView CORS restrictions.
 Requests use HTTPS, timeouts, bounded responses, and disabled redirects.
@@ -52,7 +64,7 @@ See [GitHub's Gists API](https://docs.github.com/en/rest/gists/gists).
 ## Validation
 
 ```sh
-node --test tests/backup.test.mjs
+node --test tests/*.test.mjs
 npm run check
 npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
@@ -60,7 +72,8 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 Live token connection and gist operations require a real GitHub token. For a
 manual check, export a catalog, merge and replace it from JSON, sign in, create a
-gist, update it after confirmation, and restore it. Verify cancelling a file dialog
+gist, update the same gist after confirmation, and restore both the latest and
+an older revision. Verify your main gist selection survives reopening Settings. Verify cancelling a file dialog
 or import leaves the catalog untouched; malformed JSON shows an error; cancelling
 restarting the app keeps your account connected;
 both public and secret creation respect the chosen visibility; shared gist imports

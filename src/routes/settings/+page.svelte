@@ -5,6 +5,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { createBackup, parseBackup, parseGistId, restoreSources, sourcesKey, type Backup } from "$lib/backup";
+  import { chooseMainBackup, mainBackupKey, type Gist, type GistRevision } from "$lib/gists";
 
   const backgroundKey = "updainium.background.v1";
   let backgroundEnabled = $state(false);
@@ -31,10 +32,15 @@
   let applyPreferences = $state(true);
   let login = $state("");
   let accessToken = $state("");
-  type Gist = { id: string; description: string | null; updated_at: string; public: boolean };
   let gists = $state<Gist[]>([]);
+  let backupsLoaded = $state(false);
   let selectedGist = $state("");
+  const mainBackup = $derived(gists.find((gist) => gist.id === selectedGist));
   let confirmUpload = $state(false);
+  let expectedRevision = $state("");
+  let showRestore = $state(false);
+  let revisions = $state<GistRevision[]>([]);
+  let selectedRevision = $state("");
   let gistVisibility = $state<"secret" | "public">("secret");
   let sharedGist = $state("");
 
@@ -183,7 +189,40 @@
     const loaded = await invoke<Gist[]>("github_list_backups");
     if (attempt !== githubAttempt) return;
     gists = loaded;
-    if (!gists.some((gist) => gist.id === selectedGist)) selectedGist = gists[0]?.id ?? "";
+    backupsLoaded = true;
+    const remembered = localStorage.getItem(mainBackupKey(login));
+    selectMainBackup(chooseMainBackup(gists, remembered));
+  }
+
+  function selectMainBackup(id: string): void {
+    selectedGist = id;
+    confirmUpload = false;
+    expectedRevision = "";
+    showRestore = false;
+    revisions = [];
+    selectedRevision = "";
+    if (id) localStorage.setItem(mainBackupKey(login), id);
+    else localStorage.removeItem(mainBackupKey(login));
+  }
+
+  async function prepareUpdate(): Promise<void> {
+    const attempt = githubAttempt;
+    connectionStatus = "Checking the latest backup on GitHub…";
+    const info = await invoke<{ gist: Gist; revision: string }>("github_backup_info", { id: selectedGist });
+    if (attempt !== githubAttempt) return;
+    gists = gists.map((gist) => gist.id === info.gist.id ? info.gist : gist);
+    expectedRevision = info.revision;
+    confirmUpload = true;
+  }
+
+  async function prepareRestore(): Promise<void> {
+    const attempt = githubAttempt;
+    connectionStatus = "Loading backup revision history from GitHub…";
+    const history = await invoke<GistRevision[]>("github_backup_history", { id: selectedGist });
+    if (attempt !== githubAttempt) return;
+    revisions = history;
+    selectedRevision = "";
+    showRestore = true;
   }
 
   async function connectToken(): Promise<void> {
@@ -204,8 +243,12 @@
     login = "";
     accessToken = "";
     gists = [];
+    backupsLoaded = false;
     selectedGist = "";
     confirmUpload = false;
+    showRestore = false;
+    revisions = [];
+    expectedRevision = "";
     notice = "Disconnected from GitHub on this device.";
   }
 
@@ -218,10 +261,10 @@
     connectionStatus = "Uploading your backup to GitHub…";
     const content = await backupContent();
     if (attempt !== githubAttempt) return;
-    const gist = await invoke<Gist>("github_write_backup", { id, content, isPublic: gistVisibility === "public" });
+    const gist = await invoke<Gist>("github_write_backup", { id, content, isPublic: gistVisibility === "public", expectedRevision: id ? expectedRevision : null });
     if (attempt !== githubAttempt) return;
     confirmUpload = false;
-    selectedGist = gist.id;
+    selectMainBackup(gist.id);
     await loadGists();
     notice = `Backup saved to a ${gist.public ? "public" : "secret"} GitHub gist: https://gist.github.com/${gist.id}`;
   }
@@ -229,7 +272,7 @@
   async function downloadGist(): Promise<void> {
     const attempt = githubAttempt;
     connectionStatus = "Downloading your backup from GitHub…";
-    const content = await invoke<string>("github_read_backup", { id: parseGistId(selectedGist) });
+    const content = await invoke<string>("github_read_backup", { id: parseGistId(selectedGist), revision: selectedRevision || null });
     if (attempt === githubAttempt) previewImport(content);
   }
 
@@ -278,6 +321,16 @@
   <title>Updainium — Settings</title>
   <meta name="description" content="Configure how Updainium starts and runs." />
 </svelte:head>
+
+{#snippet backupVisibility()}
+  <label class="field">Backup visibility
+    <select bind:value={gistVisibility} disabled={busy}>
+      <option value="secret">Secret — unlisted, readable by anyone with the link</option>
+      <option value="public">Public — visible to everyone and discoverable on GitHub</option>
+    </select>
+  </label>
+  {#if gistVisibility === "public"}<p class="warning">A public backup shares your tracked apps and startup preferences with everyone.</p>{/if}
+{/snippet}
 
 <main class="settings-page">
   <section class="content">
@@ -382,39 +435,69 @@
           {#if login}
             <div class="account-row"><strong>Connected as {login}</strong><button class="secondary" disabled={busy} onclick={() => runGithub(disconnect)}>Disconnect</button></div>
             <p>Your sign-in is saved in this computer’s system credential store. Tokens are never included in JSON or gist backups.</p>
-            <label class="field">New backup visibility
-              <select bind:value={gistVisibility} disabled={busy}>
-                <option value="secret">Secret — unlisted, readable by anyone with the link</option>
-                <option value="public">Public — visible to everyone and discoverable on GitHub</option>
-              </select>
-            </label>
-            <p>Visibility applies when creating a backup. Updating a backup keeps its existing visibility.</p>
-            {#if gistVisibility === "public"}<p class="warning">A public backup shares your tracked apps and startup preferences with everyone.</p>{/if}
-            <label class="field">Your backups
-              <select bind:value={selectedGist} disabled={busy} onchange={() => confirmUpload = false}>
-                <option value="">Select a backup</option>
-                {#each gists as gist}<option value={gist.id}>{gist.description || "Updainium backup"} · {new Date(gist.updated_at).toLocaleString()} · {gist.id.slice(0, 8)}{gist.public ? " · public" : ""}</option>{/each}
-              </select>
-            </label>
-            {#if !gists.length}<p>No Updainium backup gists found. Create one to get started.</p>{/if}
-            <label class="field">Gist ID (optional)
-              <input bind:value={selectedGist} disabled={busy} placeholder="Paste an existing backup gist ID" oninput={() => confirmUpload = false} />
-            </label>
-            <div class="actions">
-              <button disabled={!ready || busy} onclick={() => runGithub(() => uploadGist(null))}>Create {gistVisibility} backup</button>
-              <button class="secondary" disabled={!ready || busy || !selectedGist} onclick={() => confirmUpload = true}>Update selected backup</button>
-              <button class="secondary" disabled={!ready || busy || !selectedGist} onclick={() => runGithub(downloadGist)}>Restore selected backup</button>
-              <button class="secondary" disabled={busy || !selectedGist.trim()} onclick={() => runGithub(() => openGist(selectedGist))}>Open gist</button>
-              <button class="secondary" disabled={busy} onclick={() => runGithub(loadGists)}>Refresh</button>
-            </div>
-            {#if confirmUpload}
-              <div class="upload-confirm">
-                <p>This overwrites the backup in gist {selectedGist} with your current apps and preferences, keeping its current visibility.</p>
-                <div class="actions">
-                  <button disabled={busy} onclick={() => runGithub(() => uploadGist(selectedGist))}>Confirm update</button>
-                  <button class="secondary" disabled={busy} onclick={() => confirmUpload = false}>Cancel</button>
-                </div>
+            {#if !backupsLoaded}
+              <p>Load your existing backups before creating or updating one.</p>
+              <div class="actions"><button disabled={busy} onclick={() => runGithub(loadGists)}>Load backups</button></div>
+            {:else if !gists.length}
+              <p>Create your main backup once, then update the same gist. Older versions stay in its revision history.</p>
+              {@render backupVisibility()}
+              <div class="actions">
+                <button disabled={!ready || busy} onclick={() => runGithub(() => uploadGist(null))}>Create backup</button>
+                <button class="secondary" disabled={busy} onclick={() => runGithub(loadGists)}>Refresh</button>
               </div>
+            {:else}
+              {#if gists.length > 1}
+                <label class="field">Main backup
+                  <select value={selectedGist} disabled={busy} onchange={(event) => selectMainBackup(event.currentTarget.value)}>
+                    <option value="">Choose your main backup</option>
+                    {#each gists as gist}<option value={gist.id}>{gist.description || "Updainium backup"} · {new Date(gist.updated_at).toLocaleString()} · {gist.id.slice(0, 8)} · {gist.public ? "public" : "secret"}</option>{/each}
+                  </select>
+                </label>
+                <p>Your choice is remembered for this GitHub account on this computer. Other gists are kept.</p>
+              {/if}
+              {#if mainBackup}
+                <p><strong>Main backup · {mainBackup.public ? "Public" : "Secret"}</strong><br />Last updated {new Date(mainBackup.updated_at).toLocaleString()}</p>
+                <p>Updates reuse this gist and preserve its previous versions.</p>
+              {:else}
+                <p>Select the gist you want to keep updating.</p>
+              {/if}
+              <div class="actions">
+                <button disabled={!ready || busy || !mainBackup} onclick={() => runGithub(prepareUpdate)}>Update backup</button>
+                <button class="secondary" disabled={!ready || busy || !mainBackup} onclick={() => runGithub(prepareRestore)}>Restore backup</button>
+                <button class="secondary" disabled={busy || !mainBackup} onclick={() => runGithub(() => openGist(selectedGist))}>Open gist</button>
+                <button class="secondary" disabled={busy} onclick={() => runGithub(loadGists)}>Refresh</button>
+              </div>
+              {#if confirmUpload && mainBackup}
+                <div class="upload-confirm">
+                  <p>The latest backup was updated {new Date(mainBackup.updated_at).toLocaleString()}. Check this date if another computer also uses this backup.</p>
+                  <p>Upload your current apps and preferences as a new revision? Existing revisions and visibility will be preserved.</p>
+                  <div class="actions">
+                    <button disabled={busy} onclick={() => runGithub(() => uploadGist(selectedGist))}>Confirm update</button>
+                    <button class="secondary" disabled={busy} onclick={() => confirmUpload = false}>Cancel</button>
+                  </div>
+                </div>
+              {/if}
+              {#if showRestore}
+                <div class="upload-confirm">
+                  <label class="field">Version to restore
+                    <select bind:value={selectedRevision} disabled={busy}>
+                      <option value="">Latest version</option>
+                      {#each revisions.slice(1) as revision}<option value={revision.version}>{new Date(revision.committed_at).toLocaleString()} · {revision.version.slice(0, 8)}</option>{/each}
+                    </select>
+                  </label>
+                  <p>Choose the latest backup or an older revision. You can review the apps and choose add or replace before importing.</p>
+                  <div class="actions">
+                    <button disabled={busy} onclick={() => runGithub(downloadGist)}>Preview restore</button>
+                    <button class="secondary" disabled={busy} onclick={() => showRestore = false}>Cancel</button>
+                  </div>
+                </div>
+              {/if}
+              <details class="additional-backup">
+                <summary>Create a separate backup</summary>
+                <p>Use another gist for a separate app collection. It becomes your main backup; existing gists are kept.</p>
+                {@render backupVisibility()}
+                <div class="actions"><button class="secondary" disabled={!ready || busy} onclick={() => runGithub(() => uploadGist(null))}>Create separate backup</button></div>
+              </details>
             {/if}
           {:else}
             <p>Create a GitHub personal access token with the <strong>gist</strong> scope, then paste it here. A fine-grained token with Gists read and write permission also works.</p>
@@ -466,6 +549,8 @@
   .check-field { display: flex; align-items: center; gap: 10px; margin: 20px 0 0; }
   .check-field input { accent-color: var(--accent); }
   .account-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
+  .additional-backup { margin-top: 24px; }
+  .additional-backup summary { cursor: pointer; color: var(--muted); }
   .upload-confirm { margin-top: 18px; padding: 4px 16px 16px; border: 1px solid var(--border); border-radius: 16px; overflow-wrap: anywhere; }
   .group-body .warning { color: #b45309; }
   .notice { margin: 0 0 16px; padding: 12px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); line-height: 1.5; }

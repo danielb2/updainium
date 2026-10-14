@@ -98,6 +98,8 @@ pub fn run() {
             github::github_connect_token,
             github::github_cancel_request,
             github::github_list_backups,
+            github::github_backup_info,
+            github::github_backup_history,
             github::github_read_backup,
             github::github_write_backup,
             get_platform,

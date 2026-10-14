@@ -141,6 +141,77 @@ pub struct GistSummary {
     public: bool,
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct GistRevision {
+    version: String,
+    committed_at: String,
+}
+
+#[derive(Serialize)]
+pub struct BackupInfo {
+    gist: GistSummary,
+    revision: String,
+}
+
+fn revision_id(revision: &str) -> Result<(), String> {
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Invalid gist revision.".into());
+    }
+    Ok(())
+}
+
+fn verify_revision(value: &Value, expected: &str) -> Result<(), String> {
+    revision_id(expected)?;
+    if value["history"][0]["version"].as_str() != Some(expected) {
+        return Err("This backup changed on GitHub since you reviewed it. Refresh and review the latest update before uploading.".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn github_backup_info(
+    state: State<'_, GithubState>,
+    id: String,
+) -> Result<BackupInfo, String> {
+    github_operation(&state, async {
+        gist_id(&id)?;
+        let value = api(&token(&state)?, Method::GET, &format!("/gists/{id}"), None).await?;
+        if !value["files"][FILE_NAME].is_object() {
+            return Err("This gist is not an Updainium backup.".into());
+        }
+        let revision = value["history"][0]["version"]
+            .as_str()
+            .ok_or("GitHub did not return the current backup revision.")?
+            .to_owned();
+        revision_id(&revision)?;
+        Ok(BackupInfo {
+            gist: summary(value)?,
+            revision,
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn github_backup_history(
+    state: State<'_, GithubState>,
+    id: String,
+) -> Result<Vec<GistRevision>, String> {
+    github_operation(&state, async {
+        gist_id(&id)?;
+        let token = token(&state)?;
+        let mut history = Vec::new();
+        for page in 1..=100 {
+            let value = api(&token, Method::GET, &format!("/gists/{id}/commits?per_page=100&page={page}"), None).await?;
+            let revisions: Vec<GistRevision> = serde_json::from_value(value).map_err(|_| "GitHub returned invalid revision history.")?;
+            let complete = revisions.len() < 100;
+            history.extend(revisions);
+            if complete { return Ok(history); }
+        }
+        Err("This gist has too many revisions to list. Open the gist to browse its complete history.".into())
+    }).await
+}
+
 fn client() -> Result<Client, String> {
     Client::builder()
         .user_agent("Updainium")
@@ -368,11 +439,18 @@ pub async fn github_list_backups(
 pub async fn github_read_backup(
     state: State<'_, GithubState>,
     id: String,
+    revision: Option<String>,
 ) -> Result<String, String> {
     github_operation(&state, async {
         gist_id(&id)?;
         // Public and secret gists are readable by ID without an account, including shared catalogs.
-        let value = api("", Method::GET, &format!("/gists/{id}"), None).await?;
+        let path = if let Some(revision) = revision {
+            revision_id(&revision)?;
+            format!("/gists/{id}/{revision}")
+        } else {
+            format!("/gists/{id}")
+        };
+        let value = api("", Method::GET, &path, None).await?;
         let file = &value["files"][FILE_NAME];
         if file["truncated"].as_bool() == Some(true) {
             let raw_url = file["raw_url"]
@@ -427,6 +505,7 @@ pub async fn github_write_backup(
     id: Option<String>,
     content: String,
     is_public: bool,
+    expected_revision: Option<String>,
 ) -> Result<GistSummary, String> {
     github_operation(&state, async {
         validate_backup_size(&content)?;
@@ -435,6 +514,10 @@ pub async fn github_write_backup(
         let value = if let Some(id) = id {
             gist_id(&id)?;
             let existing = api(&token, Method::GET, &format!("/gists/{id}"), None).await?;
+            let expected = expected_revision
+                .as_deref()
+                .ok_or("Review the latest backup before updating it.")?;
+            verify_revision(&existing, expected)?;
             if !existing["files"][FILE_NAME].is_object() {
                 return Err("This gist is not an Updainium backup.".into());
             }
@@ -453,6 +536,21 @@ pub async fn github_write_backup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revision_checks_reject_invalid_paths_and_stale_updates() {
+        let current = "a".repeat(40);
+        let older = "b".repeat(40);
+        let gist = json!({ "history": [{ "version": current }] });
+        assert!(verify_revision(&gist, &current).is_ok());
+        assert!(verify_revision(&gist, &older)
+            .unwrap_err()
+            .contains("changed on GitHub"));
+        assert!(verify_revision(&json!({}), &current).is_err());
+        for revision in ["", "../other", "abc?token=x", "abcd"] {
+            assert!(revision_id(revision).is_err());
+        }
+    }
 
     #[test]
     fn cancel_stops_pending_request_and_allows_next_request() {
