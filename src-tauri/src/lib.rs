@@ -1,6 +1,8 @@
 use std::{fs, io::Write, process::Command};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+mod backup;
+mod github;
 use sha2::{Digest, Sha256};
 use tauri::{
     menu::{Menu, MenuItem},
@@ -41,6 +43,7 @@ struct DownloadedAsset {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(github::GithubState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
@@ -88,6 +91,17 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            backup::export_settings_file,
+            backup::import_settings_file,
+            github::github_status,
+            github::github_disconnect,
+            github::github_connect_token,
+            github::github_cancel_request,
+            github::github_list_backups,
+            github::github_backup_info,
+            github::github_backup_history,
+            github::github_read_backup,
+            github::github_write_backup,
             get_platform,
             set_background_mode,
             identify_installed_app_identifier,
