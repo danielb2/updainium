@@ -30,6 +30,7 @@ struct ReleaseAsset {
 struct Release {
     tag_name: Option<String>,
     name: Option<String>,
+    published_at: Option<String>,
     assets: Vec<ReleaseAsset>,
 }
 
@@ -178,6 +179,9 @@ fn normalize_release(payload: serde_json::Value) -> Release {
 
     let tag_name = string_field(&payload, "tag_name");
     let name = string_field(&payload, "name");
+    let published_at = string_field(&payload, "published_at")
+        .or_else(|| string_field(&payload, "released_at"))
+        .or_else(|| string_field(&payload, "created_at"));
 
     let mut assets = Vec::new();
     match payload.get("assets") {
@@ -220,6 +224,7 @@ fn normalize_release(payload: serde_json::Value) -> Release {
     Release {
         tag_name,
         name,
+        published_at,
         assets,
     }
 }
