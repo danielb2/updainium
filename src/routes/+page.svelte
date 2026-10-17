@@ -13,6 +13,7 @@
   type Release = {
     tag_name?: string;
     name?: string;
+    published_at?: string;
     assets: ReleaseAsset[];
   };
   type SourceReference = { repo: string; url: string; repositoryPath: string; provider: string };
@@ -24,6 +25,7 @@
     assetExtension?: string;
     assetArchitecture?: Architecture;
     version: string;
+    releaseDate?: string;
     assetName: string;
     assetUrl: string;
     checkedAt: string;
@@ -33,6 +35,8 @@
     sha256?: string;
     downloadedSha256?: string;
     hashVerified?: boolean;
+    lastKnownInstalledVersion?: string;
+    installedVersionSource?: "detected" | "manual";
   };
 
   const storageKey = "updainium.sources.v1";
@@ -102,10 +106,13 @@
               typeof source.url === "string" &&
               (source.appIdentifier === undefined || typeof source.appIdentifier === "string") &&
               typeof source.version === "string" &&
+              (source.releaseDate === undefined || typeof source.releaseDate === "string") &&
               typeof source.assetName === "string" &&
               typeof source.assetUrl === "string" &&
               typeof source.checkedAt === "string" &&
               typeof source.error === "string" &&
+              (source.lastKnownInstalledVersion === undefined || typeof source.lastKnownInstalledVersion === "string") &&
+              (source.installedVersionSource === undefined || source.installedVersionSource === "detected" || source.installedVersionSource === "manual") &&
               (source.sha256 === undefined || typeof source.sha256 === "string") &&
               (source.downloadedSha256 === undefined || typeof source.downloadedSha256 === "string") &&
               (source.hashVerified === undefined || typeof source.hashVerified === "boolean") &&
@@ -338,6 +345,7 @@
           ? {
               ...item,
               version: release.tag_name || release.name || "Unversioned release",
+              releaseDate: release.published_at,
               assetName: asset.name,
               assetUrl: asset.browser_download_url,
               sha256: asset.sha256 ?? undefined,
@@ -456,6 +464,8 @@
         assetUrl: "",
         checkedAt: "",
         error: "",
+        lastKnownInstalledVersion: currentSource?.url === repo.url ? currentSource.lastKnownInstalledVersion : undefined,
+        installedVersionSource: currentSource?.url === repo.url ? currentSource.installedVersionSource : undefined,
       };
       if (editingSourceId) {
         const previousSource = sources.find((item) => item.id === editingSourceId);
@@ -499,17 +509,81 @@
     }
     installedVersions[source.id] = undefined;
     try {
-      installedVersions[source.id] = await invoke<string | null>("get_installed_app_version", {
+      const installedVersion = await invoke<string | null>("get_installed_app_version", {
         identifier: source.appIdentifier,
       });
+      installedVersions[source.id] = installedVersion;
+      if (installedVersion?.trim()) rememberInstalledVersion(source.id, installedVersion, "detected");
     } catch (error) {
       installedCheckErrors = [...installedCheckErrors, source.id];
       appError = `Could not check whether ${source.repo} is installed: ${messageOf(error)}`;
     }
   }
 
+  function rememberInstalledVersion(
+    sourceId: string,
+    version: string,
+    source: "detected" | "manual",
+  ): void {
+    const normalized = version.trim();
+    if (!normalized) return;
+    sources = sources.map((item) =>
+      item.id === sourceId
+        ? { ...item, lastKnownInstalledVersion: normalized, installedVersionSource: source }
+        : item,
+    );
+  }
+
+  function installedVersionForComparison(source: TrackedSource): string | null {
+    const detected = installedVersions[source.id];
+    if (typeof detected === "string" && detected.trim()) return detected;
+    if (detected === null && source.installedVersionSource !== "manual") return null;
+    return source.lastKnownInstalledVersion ?? null;
+  }
+
+  function installedVersionIsCurrent(source: TrackedSource): boolean {
+    const installed = installedVersionForComparison(source);
+    if (!installed || !source.version) return false;
+    const installedParts = installed.match(/\d+/g)?.map(Number);
+    const latestParts = source.version.match(/\d+/g)?.map(Number);
+    return Boolean(
+      installedParts?.length && latestParts?.length &&
+      Array.from({ length: Math.max(installedParts.length, latestParts.length) }, (_, index) =>
+        (installedParts[index] ?? 0) === (latestParts[index] ?? 0),
+      ).every(Boolean),
+    );
+  }
+
+  function markUpToDate(source: TrackedSource): void {
+    if (!source.version || source.version === "Unversioned release") return;
+    rememberInstalledVersion(source.id, source.version, "manual");
+  }
+
+  function installActionLabel(source: TrackedSource): string {
+    if (downloading === source.id) return "Downloading…";
+    if (installedCheckErrors.includes(source.id)) {
+      if (hasUpdate(source)) return "Update";
+      return installedVersionForComparison(source) ? "Up to date" : "Install";
+    }
+    if (installedVersions[source.id] === undefined) {
+      if (installedVersionForComparison(source)) return hasUpdate(source) ? "Update" : "Up to date";
+      return source.appIdentifier ? "Checking…" : "Install";
+    }
+    if (installedVersionForComparison(source)) return hasUpdate(source) ? "Update" : "Up to date";
+    return "Install";
+  }
+
+  function canInstallOrUpdate(source: TrackedSource): boolean {
+    if (!source.assetUrl || checking.includes(source.id) || downloading !== null) return false;
+    if (
+      source.appIdentifier && installedVersions[source.id] === undefined &&
+      !source.lastKnownInstalledVersion && !installedCheckErrors.includes(source.id)
+    ) return false;
+    return !(installedVersionForComparison(source) && !hasUpdate(source));
+  }
+
   function hasUpdate(source: TrackedSource): boolean {
-    const installedVersion = installedVersions[source.id];
+    const installedVersion = installedVersionForComparison(source);
     if (!installedVersion || !source.version) return false;
     const installedParts = installedVersion.match(/\d+/g)?.map(Number);
     const latestParts = source.version.match(/\d+/g)?.map(Number);
@@ -594,15 +668,13 @@
     return true;
   }
 
-  function checkedLabel(value: string): string {
-    if (!value) return "Not checked yet";
-    return new Intl.DateTimeFormat("en", { dateStyle: "medium" }).format(new Date(value));
+  function releaseDateLabel(value?: string): string {
+    if (!value) return "Date unavailable";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "Date unavailable";
+    return new Intl.DateTimeFormat("en", { dateStyle: "medium" }).format(date);
   }
 
-  function checkedDateTime(value: string): string {
-    if (!value) return "Not checked yet";
-    return new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
-  }
 </script>
 
 <svelte:head>
@@ -640,24 +712,6 @@
   </aside>
 
   <main class="main-content">
-    <header class="topbar">
-      <div class="breadcrumb"><span>Library</span><span class="crumb-slash">/</span><strong>Apps</strong></div>
-      <Button
-        class="icon-button refresh-button"
-        variant="text"
-        type="button"
-        aria-label="Check for updates"
-        title="Check for updates"
-        onclick={refreshAll}
-        disabled={!sources.length || checking.length > 0}
-      >
-        <svg class:spinning={checking.length > 0} viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M20 7v5h-5M4 17v-5h5"></path>
-          <path d="M5.6 9a7 7 0 0 1 11.7-2L20 12M4 12l2.7 5a7 7 0 0 0 11.7-2"></path>
-        </svg>
-      </Button>
-    </header>
-
     <section class="content">
       {#if appError}
         <div class="notice error-notice" role="alert">{appError}<button onclick={() => (appError = "")} aria-label="Close">×</button></div>
@@ -759,16 +813,32 @@
               <div class="detail-section-label">Latest release</div>
               <h2>{selectedSource.version || "Release not checked yet"}</h2>
               <div class="detail-asset">{selectedSource.assetName || `Looking for ${selectedSource.assetExtension || "a release asset"}`}</div>
+              <div class="release-published">Release date: {releaseDateLabel(selectedSource.releaseDate)}</div>
             </div>
+            <div class="installed-version">
+              <span class="detail-section-label">Installed version</span>
+              {#if typeof installedVersions[selectedSource.id] === "string" && installedVersions[selectedSource.id]?.trim()}
+                <strong>{installedVersions[selectedSource.id]}</strong><span class="version-source">Detected on this device</span>
+              {:else if installedVersionForComparison(selectedSource)}
+                <strong>{installedVersionForComparison(selectedSource)}</strong><span class="version-source">Last known</span>
+              {:else if installedVersions[selectedSource.id] === null}
+                <strong>Not detected</strong>
+              {:else}
+                <strong>Unknown</strong>
+              {/if}
+            </div>
+            {#if selectedSource.version && selectedSource.version !== "Unversioned release" && !installedVersionIsCurrent(selectedSource)}
+              <button class="mark-current-button" type="button" onclick={() => markUpToDate(selectedSource)}>
+                Mark as up to date
+              </button>
+              <div class="installed-version-hint">Use this after you finish installing the release.</div>
+            {/if}
             {#if selectedSource.error}
               <p class="detail-error" role="alert">{selectedSource.error}</p>
             {/if}
             {#if selectedSource.downloadPath}
               <button class="reopen-link" type="button" onclick={() => reopenDownloaded(selectedSource)}>Open downloaded file</button>
             {/if}
-          </section>
-          <section class="detail-card checked-card" aria-label="Last checked">
-            Last checked: {checkedDateTime(selectedSource.checkedAt)}
           </section>
           <section class="detail-card hash-card" aria-label="Hash certificate">
             <div class="detail-section-label">Hash certificate (SHA-256)</div>
@@ -826,21 +896,9 @@
               class="detail-install-button"
               type="button"
               onclick={() => downloadAndOpen(selectedSource)}
-              disabled={!selectedSource.assetUrl || checking.includes(selectedSource.id) || downloading !== null || (Boolean(selectedSource.appIdentifier) && (installedVersions[selectedSource.id] === undefined || (installedVersions[selectedSource.id] !== null && !hasUpdate(selectedSource))))}
+              disabled={!canInstallOrUpdate(selectedSource)}
             >
-              {#if downloading === selectedSource.id}
-                Downloading…
-              {:else if !selectedSource.appIdentifier}
-                Install
-              {:else if installedCheckErrors.includes(selectedSource.id)}
-                Unavailable
-              {:else if installedVersions[selectedSource.id] === undefined}
-                Checking…
-              {:else if installedVersions[selectedSource.id] === null}
-                Install
-              {:else}
-                Update
-              {/if}
+              {installActionLabel(selectedSource)}
             </button>
           </div>
         </section>
@@ -850,6 +908,19 @@
           <h1>Apps</h1>
         </div>
         <div class="heading-actions">
+          <Button
+            class="icon-button refresh-button"
+            variant="text"
+            type="button"
+            onclick={refreshAll}
+            disabled={!sources.length || checking.length > 0}
+          >
+            <svg class:spinning={checking.length > 0} viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 7v5h-5M4 17v-5h5"></path>
+              <path d="M5.6 9a7 7 0 0 1 11.7-2L20 12M4 12l2.7 5a7 7 0 0 0 11.7-2"></path>
+            </svg>
+            <span>Check for updates</span>
+          </Button>
           <a class="settings-button" href="/settings" aria-label="Settings" title="Settings">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M19.14 12.94a7.49 7.49 0 0 0 .05-1.88l2.03-1.58-2-3.46-2.4.97a7.28 7.28 0 0 0-1.63-.95L14.82 3h-4l-.37 3.04a7.28 7.28 0 0 0-1.63.95l-2.4-.97-2 3.46 2.03 1.58a7.49 7.49 0 0 0 0 1.88l-2.03 1.58 2 3.46 2.4-.97a7.28 7.28 0 0 0 1.63.95L10.82 21h4l.37-3.04a7.28 7.28 0 0 0 1.63-.95l2.4.97 2-3.46-2.08-1.58ZM12.82 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"></path>
@@ -910,13 +981,16 @@
                     {/if}
                   </span>
                   <span class="app-details">
-                    <span class="app-title-row"><span class="app-name">{source.repo.split("/").at(-1)}</span></span>
+                    <span class="app-title-row">
+                      <span class="app-name">{source.repo.split("/").at(-1)}</span>
+                      {#if hasUpdate(source)}<span class="update-badge">Update available</span>{/if}
+                    </span>
                     <span class="repo-link">by {source.repo.split("/").slice(0, -1).join("/")}</span>
                     {#if source.error}<span class="source-error">{source.error}</span>{/if}
                   </span>
                   <span class="release-summary">
                     {#if source.version}<span class="release-version">{source.version}</span>{/if}
-                    {#if source.checkedAt}<span class="release-date">{checkedLabel(source.checkedAt)}</span>{/if}
+                    <span class="release-date" title="Latest release date">{releaseDateLabel(source.releaseDate)}</span>
                   </span>
                 </button>
               </article>
@@ -1027,6 +1101,7 @@
   .detail-avatar img { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: inherit; object-fit: cover; }
   .app-details { min-width: 0; flex: 1; }
   .app-title-row { display: flex; align-items: center; gap: 9px; }
+  .update-badge { display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 999px; background: color-mix(in srgb, var(--accent, #705394) 15%, transparent); color: var(--accent-strong, #60427f); font-size: 10px; font-weight: 650; line-height: 1.2; white-space: nowrap; }
   .app-name { overflow: hidden; margin: 0; color: #34333f; font-size: 14px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
   .app-name { display: block; }
   .repo-link { display: inline-block; max-width: 100%; overflow: hidden; margin-top: 4px; color: #8c8a98; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
@@ -1040,6 +1115,9 @@
   .spinning { animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .button-spinner { width: 12px; height: 12px; border: 2px solid rgb(255 255 255 / 40%); border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
+  :global(.icon-button.refresh-button) { display: flex; width: auto; min-width: 0; height: 34px; align-items: center; gap: 8px; padding: 0 12px; border: 1px solid var(--border, #e9e0ec); border-radius: 18px; color: var(--muted, #56515d); font-size: 12px; white-space: nowrap; }
+  :global(.icon-button.refresh-button:hover) { border-color: var(--border, #e9e0ec); background: var(--surface-muted, #eee7f0); color: var(--text, #24212a); }
+  :global(.icon-button.refresh-button:disabled) { opacity: .55; }
   .empty-state { display: flex; min-height: 358px; flex-direction: column; align-items: center; justify-content: center; padding: 35px; border: 1px dashed #e5e3ed; border-radius: 10px; background: #fff; text-align: center; }
   .empty-state > p { max-width: 410px; margin: 9px 0 19px; color: #8c8a97; font-size: 12px; line-height: 1.65; }
   .empty-filter { padding: 43px 16px; border: 1px solid #eeedf3; border-radius: 8px; background: #fff; color: #8c8a97; text-align: center; font-size: 12px; }
@@ -1081,9 +1159,16 @@
   .detail-section-label { margin-bottom: 8px; color: var(--subtle, #817b87); font-size: 12px; }
   .detail-release h2 { margin: 0; color: var(--text, #24212a); font-size: 20px; font-weight: 500; }
   .detail-asset { margin-top: 7px; color: var(--muted, #56515d); font-size: 14px; overflow-wrap: anywhere; }
+  .release-published { margin-top: 7px; color: var(--subtle, #817b87); font-size: 12px; }
+  .installed-version { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px; margin-top: 17px; color: var(--text, #24212a); font-size: 13px; }
+  .installed-version .detail-section-label { flex-basis: 100%; margin: 0; }
+  .installed-version strong { font-weight: 550; }
+  .version-source { color: var(--subtle, #817b87); font-size: 11px; }
+  .mark-current-button { margin-top: 13px; padding: 7px 12px; border: 1px solid var(--border, #e9e0ec); border-radius: 16px; background: var(--surface-raised, #fffaff); color: var(--accent-strong, #60427f); font-size: 12px; cursor: pointer; }
+  .mark-current-button:hover { background: var(--surface-muted, #eee7f0); }
+  .installed-version-hint { margin-top: 6px; color: var(--subtle, #817b87); font-size: 11px; }
   .detail-error { margin: 12px 0 0; color: #b84b48; font-size: 12px; line-height: 1.5; }
   .release-card .reopen-link { margin-top: 7px; }
-  .checked-card { padding: 20px 24px; color: var(--muted, #56515d); font-size: 14px; }
   .hash-card { padding: 20px 24px; }
   .hash-label { margin-top: 10px; color: var(--muted, #56515d); font-size: 12px; }
   .hash-value { display: block; margin-top: 4px; color: var(--text, #24212a); font-family: "Roboto Mono", monospace; font-size: 12px; overflow-wrap: anywhere; user-select: all; }
@@ -1434,8 +1519,7 @@
     .detail-card { margin-top: 14px; border-radius: 22px; }
     .release-card { padding: 21px 19px; }
     .detail-release h2 { font-size: 18px; }
-    .detail-asset, .checked-card, .detail-extension { font-size: 13px; }
-    .checked-card { padding: 19px; }
+    .detail-asset, .detail-extension { font-size: 13px; }
     .source-card { padding: 19px 19px 0; }
     .detail-repository { font-size: 14px; }
     :global(.detail-download) { width: calc(100% + 38px); min-height: 58px; margin-right: -19px; margin-left: -19px; font-size: 14px; }
