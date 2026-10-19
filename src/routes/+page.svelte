@@ -16,6 +16,7 @@
     tag_name?: string;
     name?: string;
     published_at?: string;
+    body?: string;
     assets: ReleaseAsset[];
   };
   type SourceReference = { repo: string; url: string; repositoryPath: string; provider: string };
@@ -35,6 +36,7 @@
     assetArchitecture?: Architecture;
     version: string;
     releaseDate?: string;
+    releaseNotes?: string;
     assetName: string;
     assetUrl: string;
     checkedAt: string;
@@ -96,6 +98,8 @@
   let downloadProgress = $state<DownloadProgressEvent | null>(null);
   let installedVersions = $state<Record<string, string | null | undefined>>({});
   let installedCheckErrors = $state<string[]>([]);
+  let installedVersionEditorOpenFor = $state<string | null>(null);
+  let installedVersionDraft = $state("");
   let snackbarMessage = $state("");
   let snackbarOpen = $state(false);
   let snackbarTimer: ReturnType<typeof setTimeout> | undefined;
@@ -156,6 +160,7 @@
               (source.appIdentifier === undefined || typeof source.appIdentifier === "string") &&
               typeof source.version === "string" &&
               (source.releaseDate === undefined || typeof source.releaseDate === "string") &&
+              (source.releaseNotes === undefined || typeof source.releaseNotes === "string") &&
               typeof source.assetName === "string" &&
               typeof source.assetUrl === "string" &&
               typeof source.checkedAt === "string" &&
@@ -417,6 +422,7 @@
               ...item,
               version: release.tag_name || release.name || "Unversioned release",
               releaseDate: release.published_at,
+              releaseNotes: release.body,
               assetName: asset.name,
               assetUrl: asset.browser_download_url,
               sha256: asset.sha256 ?? undefined,
@@ -620,6 +626,8 @@
   ): void {
     const normalized = version.trim();
     if (!normalized) return;
+    const current = sources.find((item) => item.id === sourceId);
+    if (source === "detected" && current?.installedVersionSource === "manual") return;
     sources = sources.map((item) =>
       item.id === sourceId
         ? { ...item, lastKnownInstalledVersion: normalized, installedVersionSource: source }
@@ -629,9 +637,33 @@
 
   function installedVersionForComparison(source: TrackedSource): string | null {
     const detected = installedVersions[source.id];
+    if (source.installedVersionSource === "manual" && source.lastKnownInstalledVersion) {
+      return source.lastKnownInstalledVersion;
+    }
     if (typeof detected === "string" && detected.trim()) return detected;
     if (detected === null && source.installedVersionSource !== "manual") return null;
     return source.lastKnownInstalledVersion ?? null;
+  }
+
+  function openInstalledVersionEditor(source: TrackedSource): void {
+    installedVersionEditorOpenFor = source.id;
+    installedVersionDraft = installedVersionForComparison(source) ?? "";
+  }
+
+  function saveManualInstalledVersion(source: TrackedSource): void {
+    const version = installedVersionDraft.trim();
+    if (!version) return;
+    rememberInstalledVersion(source.id, version, "manual");
+    installedVersionEditorOpenFor = null;
+  }
+
+  function clearManualInstalledVersion(source: TrackedSource): void {
+    sources = sources.map((item) =>
+      item.id === source.id
+        ? { ...item, lastKnownInstalledVersion: undefined, installedVersionSource: undefined }
+        : item,
+    );
+    installedVersionEditorOpenFor = null;
   }
 
   function installedVersionIsCurrent(source: TrackedSource): boolean {
@@ -982,7 +1014,9 @@
             </div>
             <div class="installed-version">
               <span class="detail-section-label">Installed version</span>
-              {#if typeof installedVersions[selectedSource.id] === "string" && installedVersions[selectedSource.id]?.trim()}
+              {#if selectedSource.installedVersionSource === "manual" && selectedSource.lastKnownInstalledVersion}
+                <strong>{selectedSource.lastKnownInstalledVersion}</strong><span class="version-source">Manually set</span>
+              {:else if typeof installedVersions[selectedSource.id] === "string" && installedVersions[selectedSource.id]?.trim()}
                 <strong>{installedVersions[selectedSource.id]}</strong><span class="version-source">Detected on this device</span>
               {:else if installedVersionForComparison(selectedSource)}
                 <strong>{installedVersionForComparison(selectedSource)}</strong><span class="version-source">Last known</span>
@@ -992,11 +1026,29 @@
                 <strong>Unknown</strong>
               {/if}
             </div>
+            <div class="installed-version-actions">
             {#if selectedSource.version && selectedSource.version !== "Unversioned release" && !installedVersionIsCurrent(selectedSource)}
               <button class="mark-current-button" type="button" onclick={() => markUpToDate(selectedSource)}>
                 Mark as up to date
               </button>
-              <div class="installed-version-hint">Use this after you finish installing the release.</div>
+            {/if}
+              <button class="mark-current-button" type="button" onclick={() => openInstalledVersionEditor(selectedSource)}>
+                {selectedSource.installedVersionSource === "manual" ? "Edit saved version" : "Set installed version"}
+              </button>
+              {#if selectedSource.installedVersionSource === "manual"}
+                <button class="mark-current-button" type="button" onclick={() => clearManualInstalledVersion(selectedSource)}>Clear saved version</button>
+              {/if}
+            </div>
+            {#if installedVersionEditorOpenFor === selectedSource.id}
+              <div class="installed-version-editor">
+                <label for="installed-version-input">Installed version</label>
+                <input id="installed-version-input" bind:value={installedVersionDraft} placeholder="e.g. 1.2.3" />
+                <div class="installed-version-editor-actions">
+                  <button class="mark-current-button" type="button" onclick={() => saveManualInstalledVersion(selectedSource)} disabled={!installedVersionDraft.trim()}>Save version</button>
+                  <button class="mark-current-button" type="button" onclick={() => (installedVersionEditorOpenFor = null)}>Cancel</button>
+                </div>
+                <div class="installed-version-hint">Set an older version to preview update availability and release notes.</div>
+              </div>
             {/if}
             {#if selectedSource.error}
               <p class="detail-error" role="alert">{selectedSource.error}</p>
@@ -1005,6 +1057,17 @@
               <button class="reopen-link" type="button" onclick={() => reopenDownloaded(selectedSource)}>Open downloaded file</button>
             {/if}
           </section>
+          {#if hasUpdate(selectedSource)}
+            <section class="detail-card release-notes-card" aria-label="Release notes">
+              <div class="detail-section-label">Release notes</div>
+              <h2>What’s new in {selectedSource.version}</h2>
+              {#if selectedSource.releaseNotes?.trim()}
+                <div class="release-notes-content">{selectedSource.releaseNotes}</div>
+              {:else}
+                <p class="release-notes-empty">No release notes were provided for this release.</p>
+              {/if}
+            </section>
+          {/if}
           <section class="detail-card hash-card" aria-label="Hash certificate">
             <div class="detail-section-label">Hash certificate (SHA-256)</div>
             {#if selectedSource.sha256}
@@ -1421,12 +1484,21 @@
   .detail-name span { color: var(--muted, #56515d); font-size: 14px; }
   .detail-card { overflow: hidden; margin-top: 17px; border-radius: 22px; background: var(--surface, #f7f0f8); color: var(--text, #24212a); }
   .release-card { padding: 23px 24px; }
+  .release-notes-card { padding: 21px 24px; }
+  .release-notes-card h2 { margin: 0; color: var(--text, #24212a); font-size: 17px; font-weight: 500; }
+  .release-notes-content { max-height: 360px; margin-top: 12px; overflow: auto; color: var(--muted, #56515d); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .release-notes-empty { margin: 12px 0 0; color: var(--subtle, #817b87); font-size: 13px; }
   .detail-section-label { margin-bottom: 8px; color: var(--subtle, #817b87); font-size: 12px; }
   .detail-release h2 { margin: 0; color: var(--text, #24212a); font-size: 20px; font-weight: 500; }
   .detail-asset { margin-top: 7px; color: var(--muted, #56515d); font-size: 14px; overflow-wrap: anywhere; }
   .release-published { margin-top: 7px; color: var(--subtle, #817b87); font-size: 12px; }
   .installed-version { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px; margin-top: 17px; color: var(--text, #24212a); font-size: 13px; }
   .installed-version .detail-section-label { flex-basis: 100%; margin: 0; }
+  .installed-version-actions, .installed-version-editor-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .installed-version-actions { margin-top: 12px; }
+  .installed-version-editor { display: grid; gap: 8px; margin-top: 13px; }
+  .installed-version-editor label { color: var(--muted, #56515d); font-size: 12px; }
+  .installed-version-editor input { width: min(100%, 300px); padding: 9px 11px; border: 1px solid var(--border, #e9e0ec); border-radius: 12px; background: var(--surface-raised, #fffaff); color: var(--text, #24212a); font: inherit; }
   .installed-version strong { font-weight: 550; }
   .version-source { color: var(--subtle, #817b87); font-size: 11px; }
   .mark-current-button { margin-top: 13px; padding: 7px 12px; border: 1px solid var(--border, #e9e0ec); border-radius: 16px; background: var(--surface-raised, #fffaff); color: var(--accent-strong, #60427f); font-size: 12px; cursor: pointer; }
