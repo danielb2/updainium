@@ -1057,7 +1057,7 @@
               <button class="reopen-link" type="button" onclick={() => reopenDownloaded(selectedSource)}>Open downloaded file</button>
             {/if}
           </section>
-          {#if hasUpdate(selectedSource)}
+          {#if selectedSource.version && selectedSource.version !== "Unversioned release" && (hasUpdate(selectedSource) || !installedVersionForComparison(selectedSource))}
             <section class="detail-card release-notes-card" aria-label="Release notes">
               <div class="detail-section-label">Release notes</div>
               <h2>What’s new in {selectedSource.version}</h2>
