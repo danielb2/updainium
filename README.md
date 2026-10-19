@@ -2,6 +2,8 @@
 
 Get release files straight from the source.
 
+[![Downloads](https://img.shields.io/github/downloads/livrasand/Updainium/total)](https://github.com/livrasand/Updainium/releases)
+
 ## What is Updainium?
 Inspired by the incredible [Obtainium](https://github.com/ImranR98/Obtainium), Updainium is natively tailored for your desktop operating system. 
 
@@ -43,7 +45,7 @@ We promise:
 
 
 ## Limitations
-- For some sources that lack standardized APIs, Updainium gathers data using web scraping. This means tracking can occasionally break if the source website changes its design. In these specific edge cases, more reliable methods may temporarily be unavailable.
+- For some sources that lack standardized APIs, Updainium gathers data using web scraping. This means tracking can occasionally break if the source website changes its design. In these specific edge cases, more reliable methods may temporarily be unavailable. See [LEGAL.md](LEGAL.md): users are responsible for evaluating the software they choose to download and run.
 
 ## Screenshots
 
@@ -52,7 +54,6 @@ We promise:
 | <picture><source srcset="./static/3-dark.png" media="(prefers-color-scheme: dark)" /> <img src="./static/3.png" alt="Add App Page" /></picture> | <picture><source srcset="./static/4-dark.png" media="(prefers-color-scheme: dark)" /> <img src="./static/4.png" alt="Settings Page" /></picture> |
 
 ---
-
 
 > [!IMPORTANT]
 > Upvote Updainium on [AlternativeTo](https://alternativeto.net/software/updainium/), [Product Hunt](https://www.producthunt.com/products/updainium) to help me promote it.
@@ -66,3 +67,11 @@ We promise:
 *✨ Thanks for visiting **Updainium**!*
 
 <img src="https://visitor-badge.laobi.icu/badge?page_id=livrasand.Updainium&style=for-the-badge&color=00d4ff" alt="Views">
+
+---
+
+## Contributors
+
+<a href="https://github.com/livrasand/Updainium/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=livrasand/Updainium" />
+</a>

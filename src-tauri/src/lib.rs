@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager,
+    Emitter, Manager,
 };
 use tauri_plugin_autostart::MacosLauncher;
 #[cfg(not(target_os = "macos"))]
@@ -30,6 +30,7 @@ struct ReleaseAsset {
 struct Release {
     tag_name: Option<String>,
     name: Option<String>,
+    published_at: Option<String>,
     assets: Vec<ReleaseAsset>,
 }
 
@@ -40,10 +41,38 @@ struct DownloadedAsset {
     verified: bool,
 }
 
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgress {
+    download_id: String,
+    phase: &'static str,
+    received: u64,
+    total: Option<u64>,
+}
+
+fn emit_download_progress(
+    app: &tauri::AppHandle,
+    download_id: &str,
+    phase: &'static str,
+    received: u64,
+    total: Option<u64>,
+) {
+    let _ = app.emit(
+        "download-progress",
+        DownloadProgress {
+            download_id: download_id.to_owned(),
+            phase,
+            received,
+            total,
+        },
+    );
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(github::GithubState::default())
+        .manage(github::ApiTokenState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
@@ -102,11 +131,15 @@ pub fn run() {
             github::github_backup_history,
             github::github_read_backup,
             github::github_write_backup,
+            github::github_api_token_status,
+            github::github_api_token_save,
+            github::github_api_token_clear,
             get_platform,
             set_background_mode,
             identify_installed_app_identifier,
             identify_app_identifier_from_path,
             get_installed_app_version,
+            uninstall_app,
             download_release_asset,
             fetch_release_metadata,
             fetch_repository_icon
@@ -178,6 +211,9 @@ fn normalize_release(payload: serde_json::Value) -> Release {
 
     let tag_name = string_field(&payload, "tag_name");
     let name = string_field(&payload, "name");
+    let published_at = string_field(&payload, "published_at")
+        .or_else(|| string_field(&payload, "released_at"))
+        .or_else(|| string_field(&payload, "created_at"));
 
     let mut assets = Vec::new();
     match payload.get("assets") {
@@ -220,17 +256,31 @@ fn normalize_release(payload: serde_json::Value) -> Release {
     Release {
         tag_name,
         name,
+        published_at,
         assets,
     }
 }
 
+async fn github_api_token_or_anonymous(
+    state: &github::ApiTokenState,
+) -> Option<String> {
+    github::api_token(state.clone())
+        .await
+        .ok()
+        .flatten()
+}
+
 #[tauri::command]
-async fn fetch_release_metadata(api_urls: Vec<String>) -> Result<Release, String> {
+async fn fetch_release_metadata(
+    api_urls: Vec<String>,
+    token_state: tauri::State<'_, github::ApiTokenState>,
+) -> Result<Release, String> {
     if api_urls.is_empty() {
         return Err("No release API endpoint could be derived from the URL.".into());
     }
 
     let client = https_client()?;
+    let api_token = github_api_token_or_anonymous(&token_state).await;
     let mut not_found = false;
     let mut transport_error: Option<String> = None;
 
@@ -243,13 +293,15 @@ async fn fetch_release_metadata(api_urls: Vec<String>) -> Result<Release, String
             }
         };
 
-        let response = match client
+        let mut request = client
             .get(parsed_url)
             .header(reqwest::header::USER_AGENT, "Updainium")
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-        {
+            .header(reqwest::header::ACCEPT, "application/json");
+        if let Some(token) = &api_token {
+            request = request.bearer_auth(token);
+        }
+
+        let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
                 transport_error = Some(error.to_string());
@@ -281,12 +333,20 @@ async fn fetch_release_metadata(api_urls: Vec<String>) -> Result<Release, String
 }
 
 #[tauri::command]
-async fn fetch_repository_icon(api_url: String) -> Result<Option<String>, String> {
+async fn fetch_repository_icon(
+    api_url: String,
+    token_state: tauri::State<'_, github::ApiTokenState>,
+) -> Result<Option<String>, String> {
     let parsed_url = parse_https_url(&api_url, "The repository API must be reached over HTTPS.")?;
-    let payload: serde_json::Value = https_client()?
+    let api_token = github_api_token_or_anonymous(&token_state).await;
+    let mut request = https_client()?
         .get(parsed_url)
         .header(reqwest::header::USER_AGENT, "Updainium")
-        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::ACCEPT, "application/json");
+    if let Some(token) = &api_token {
+        request = request.bearer_auth(token);
+    }
+    let payload: serde_json::Value = request
         .send()
         .await
         .map_err(|error| error.to_string())?
@@ -537,7 +597,7 @@ fn identify_macos_app_identifier(
             .output()
             .map_err(|error| error.to_string())?;
         for path in String::from_utf8_lossy(&matches.stdout).lines() {
-            if !path.ends_with(".app") {
+            if !path.ends_with(".app") || !std::path::Path::new(path).is_dir() {
                 continue;
             }
             let info = format!("{path}/Contents/Info.plist");
@@ -672,13 +732,7 @@ fn identify_linux_app_identifier(app_name: &str) -> Result<Option<String>, Strin
 
 #[tauri::command]
 fn get_installed_app_version(identifier: String) -> Result<Option<String>, String> {
-    if identifier.is_empty()
-        || !identifier
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || " .-_{}+~:@".contains(character))
-    {
-        return Err("The app/package identifier contains unsupported characters.".into());
-    }
+    validate_identifier(&identifier)?;
 
     #[cfg(target_os = "macos")]
     {
@@ -694,6 +748,161 @@ fn get_installed_app_version(identifier: String) -> Result<Option<String>, Strin
     }
     #[allow(unreachable_code)]
     Err("Installed app detection is not supported on this operating system.".into())
+}
+
+fn validate_identifier(identifier: &str) -> Result<(), String> {
+    if identifier.is_empty()
+        || !identifier
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || " .-_{}+~:@".contains(character))
+    {
+        return Err("The app/package identifier contains unsupported characters.".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn uninstall_app(identifier: String) -> Result<(), String> {
+    validate_identifier(&identifier)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        return uninstall_macos_app(&identifier);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return uninstall_windows_app(&identifier);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return uninstall_linux_app(&identifier);
+    }
+    #[allow(unreachable_code)]
+    Err("Uninstalling apps is not supported on this operating system.".into())
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_macos_app(identifier: &str) -> Result<(), String> {
+    let query = format!("kMDItemCFBundleIdentifier == '{identifier}'");
+    let mut app_directories = vec!["/Applications".to_owned()];
+    if let Some(home) = std::env::var_os("HOME") {
+        app_directories.push(
+            std::path::PathBuf::from(home)
+                .join("Applications")
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    let mut app_path: Option<String> = None;
+    for directory in app_directories {
+        let matches = Command::new("mdfind")
+            .args(["-onlyin", &directory, &query])
+            .output()
+            .map_err(|error| error.to_string())?;
+        for path in String::from_utf8_lossy(&matches.stdout).lines() {
+            if path.ends_with(".app") && std::path::Path::new(path).is_dir() {
+                app_path = Some(path.to_owned());
+                break;
+            }
+        }
+        if app_path.is_some() {
+            break;
+        }
+    }
+    let app_path = app_path.ok_or_else(|| {
+        "No installed app bundle matched this identifier, so it could not be uninstalled.".to_owned()
+    })?;
+
+    let script = format!("tell application \"Finder\" to delete POSIX file \"{app_path}\"");
+    let output = Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not move the app to the Trash: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_windows_app(identifier: &str) -> Result<(), String> {
+    let roots = [
+        r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+    ];
+    for root in roots {
+        let key = format!(r"{root}\{identifier}");
+        let value = Command::new("reg")
+            .args(["query", &key, "/v", "UninstallString"])
+            .creation_flags(0x08000000)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !value.status.success() {
+            continue;
+        }
+        let uninstall_string = String::from_utf8_lossy(&value.stdout)
+            .lines()
+            .find(|line| line.contains("UninstallString"))
+            .and_then(|line| line.splitn(2, "REG_SZ").nth(1))
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if uninstall_string.is_empty() {
+            continue;
+        }
+        let status = Command::new("cmd")
+            .args(["/C", &uninstall_string])
+            .creation_flags(0x08000000)
+            .status()
+            .map_err(|error| error.to_string())?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!(
+            "The app's uninstaller exited with status {status}."
+        ));
+    }
+    Err("No installed app matched this identifier in the Windows uninstall registry.".into())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_linux_app(identifier: &str) -> Result<(), String> {
+    let dpkg = Command::new("dpkg-query")
+        .args(["--show", "--showformat=${db:Status-Status}", "--", identifier])
+        .output();
+    if let Ok(output) = dpkg {
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "installed" {
+            let status = Command::new("pkexec")
+                .args(["apt-get", "remove", "-y", "--", identifier])
+                .status()
+                .map_err(|error| error.to_string())?;
+            if status.success() {
+                return Ok(());
+            }
+            return Err(format!("The package manager exited with status {status}."));
+        }
+    }
+    let rpm = Command::new("rpm")
+        .args(["-q", "--", identifier])
+        .output();
+    if let Ok(output) = rpm {
+        if output.status.success() {
+            let status = Command::new("pkexec")
+                .args(["rpm", "-e", "--", identifier])
+                .status()
+                .map_err(|error| error.to_string())?;
+            if status.success() {
+                return Ok(());
+            }
+            return Err(format!("The package manager exited with status {status}."));
+        }
+    }
+    Err("No installed package matched this identifier, so it could not be uninstalled.".into())
 }
 
 #[cfg(target_os = "macos")]
@@ -714,7 +923,7 @@ fn installed_macos_version(identifier: &str) -> Result<Option<String>, String> {
             .output()
             .map_err(|error| error.to_string())?;
         for path in String::from_utf8_lossy(&matches.stdout).lines() {
-            if !path.ends_with(".app") {
+            if !path.ends_with(".app") || !std::path::Path::new(path).is_dir() {
                 continue;
             }
             let info = format!("{path}/Contents/Info.plist");
@@ -827,6 +1036,7 @@ async fn download_release_asset(
     url: String,
     file_name: String,
     expected_sha256: Option<String>,
+    download_id: String,
 ) -> Result<DownloadedAsset, String> {
     let parsed_url = parse_https_url(&url, "The download must come from an HTTPS source.")?;
     let expected_sha256 = expected_sha256
@@ -875,11 +1085,22 @@ async fn download_release_asset(
     let temporary = destination.with_extension("download");
     let mut file = fs::File::create(&temporary).map_err(|error| error.to_string())?;
     let mut hasher = Sha256::new();
+    let total = response.content_length();
+    let mut received: u64 = 0;
+    let mut last_emit = std::time::Instant::now();
+    emit_download_progress(&app, &download_id, "downloading", received, total);
     while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
         hasher.update(&chunk);
         file.write_all(&chunk).map_err(|error| error.to_string())?;
+        received += chunk.len() as u64;
+        if last_emit.elapsed() >= std::time::Duration::from_millis(100) {
+            emit_download_progress(&app, &download_id, "downloading", received, total);
+            last_emit = std::time::Instant::now();
+        }
     }
+    emit_download_progress(&app, &download_id, "downloading", received, total);
     file.sync_all().map_err(|error| error.to_string())?;
+    emit_download_progress(&app, &download_id, "verifying", received, total);
     let sha256 = format!("{:x}", hasher.finalize());
     if let Some(expected_sha256) = expected_sha256.as_deref() {
         if sha256 != expected_sha256 {

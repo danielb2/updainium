@@ -32,6 +32,11 @@
   let applyPreferences = $state(true);
   let login = $state("");
   let accessToken = $state("");
+  let apiToken = $state("");
+  let apiTokenSaved = $state(false);
+  let apiTokenBusy = $state(false);
+  let apiTokenError = $state("");
+  let apiTokenNotice = $state("");
   let gists = $state<Gist[]>([]);
   let backupsLoaded = $state(false);
   let selectedGist = $state("");
@@ -60,6 +65,9 @@
         selectMainBackup(chooseMainBackup(gists, localStorage.getItem(mainBackupKey(login))));
       }
     }).catch((cause) => { if (!disposed) githubError = messageOf(cause); });
+    void invoke<boolean>("github_api_token_status").then((saved) => {
+      if (!disposed) apiTokenSaved = saved;
+    }).catch(() => { /* Token status is informational only. */ });
     return () => {
       disposed = true;
     };
@@ -155,7 +163,6 @@
     const previousBackground = oldBackground === "true";
     const current = importMode === "merge" ? JSON.parse(oldSources ?? "[]") : [];
     const nextSources = restoreSources(backup, current, importMode);
-    // Prepare serialization before changing local or operating-system settings.
     const serialized = JSON.stringify(nextSources);
     try {
       if (applyPreferences) {
@@ -260,6 +267,40 @@
     notice = "Disconnected from GitHub on this device.";
   }
 
+  async function runApiToken(action: () => Promise<void>): Promise<void> {
+    if (busy) return;
+    busy = true;
+    apiTokenBusy = true;
+    apiTokenError = "";
+    apiTokenNotice = "";
+    try {
+      await action();
+    } catch (cause) {
+      apiTokenError = messageOf(cause);
+    } finally {
+      busy = false;
+      apiTokenBusy = false;
+    }
+  }
+
+  async function saveApiToken(): Promise<void> {
+    await runApiToken(async () => {
+      const token = apiToken.trim();
+      await invoke("github_api_token_save", { accessToken: token });
+      apiToken = "";
+      apiTokenSaved = true;
+      apiTokenNotice = "Token saved. Release and update checks will now use it.";
+    });
+  }
+
+  async function clearApiToken(): Promise<void> {
+    await runApiToken(async () => {
+      await invoke("github_api_token_clear");
+      apiTokenSaved = false;
+      apiTokenNotice = "GitHub API token removed. Checks fall back to anonymous requests.";
+    });
+  }
+
   async function openGist(input: string): Promise<void> {
     await openUrl(`https://gist.github.com/${parseGistId(input)}`);
   }
@@ -344,7 +385,7 @@
   <section class="content">
       <div class="page-heading">
       <a class="back-button" href="/" aria-label="Back to apps" title="Back to apps">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6M9 12h11"></path></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor" aria-hidden="true"><path d="M640-80 240-480l400-400 71 71-329 329 329 329-71 71Z"/></svg>
       </a>
       <div>
         <h1>Settings</h1>
@@ -519,6 +560,31 @@
           {/if}
         </div>
       </section>
+
+      <section class="settings-group backup-group" class:review-dimmed={!!pendingBackup} inert={!!pendingBackup} aria-labelledby="api-token-heading">
+        <h2 id="api-token-heading">GitHub API token</h2>
+        <div class="group-body">
+          <p>Release and update checks contact the GitHub API. In some regions or behind some networks, GitHub blocks unauthenticated requests. A personal access token keeps those checks reliable. This is separate from the gist-backup sign-in and does not need the gist scope.</p>
+          {#if apiTokenError}<div class="error-notice" role="alert">{apiTokenError}</div>{/if}
+          {#if apiTokenNotice}<div class="notice" role="status">{apiTokenNotice}</div>{/if}
+          {#if apiTokenSaved}
+            <div class="account-row">
+              <strong>A GitHub API token is saved on this device</strong>
+              <button class="secondary" disabled={busy} onclick={clearApiToken}>{apiTokenBusy ? "Removing…" : "Remove token"}</button>
+            </div>
+            <p>It is stored in this computer’s system credential store and never included in JSON or gist backups.</p>
+          {:else}
+            <p>Create a token without any scopes — a plain classic token can read public repository data — then paste it here. The token is checked against GitHub before saving.</p>
+            <div class="actions">
+              <button type="button" class="secondary" disabled={busy} onclick={() => void openUrl("https://github.com/settings/tokens/new?description=Updainium")}>Create GitHub token</button>
+            </div>
+            <form onsubmit={(event) => { event.preventDefault(); if (apiToken.trim()) void saveApiToken(); }}>
+              <label class="field">GitHub token<input type="password" bind:value={apiToken} disabled={busy} autocomplete="off" spellcheck="false" /></label>
+              <div class="actions"><button type="submit" disabled={busy || !apiToken.trim()}>{apiTokenBusy ? "Verifying…" : "Save token"}</button></div>
+            </form>
+          {/if}
+        </div>
+      </section>
       {#if busy}<p role="status" class="busy-status">Working…</p>{/if}
   </section>
 </main>
@@ -568,7 +634,7 @@
   .back-button { display: grid; width: 38px; height: 38px; flex: 0 0 auto; place-items: center; border-radius: 50%; color: var(--text); text-decoration: none; transition: background .16s ease, transform .16s ease; }
   .back-button:hover { background: var(--surface-muted); }
   .back-button:active { transform: translateX(-2px); }
-  .back-button svg { width: 23px; height: 23px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .back-button svg { width: 23px; height: 23px; fill: currentColor; stroke: none; }
   h1 { margin: 0; color: var(--text); font-size: 36px; font-weight: 500; letter-spacing: -.8px; }
   .page-heading p { margin: 9px 0 0; color: var(--muted); font-size: 14px; }
   .settings-group { max-width: 760px; overflow: hidden; border: 1px solid transparent; border-radius: 24px; background: var(--surface); }

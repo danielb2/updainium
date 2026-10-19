@@ -1,6 +1,8 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
+  import { fly } from "svelte/transition";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
   import { openPath } from "@tauri-apps/plugin-opener";
@@ -13,9 +15,17 @@
   type Release = {
     tag_name?: string;
     name?: string;
+    published_at?: string;
     assets: ReleaseAsset[];
   };
   type SourceReference = { repo: string; url: string; repositoryPath: string; provider: string };
+  type DownloadPhase = "downloading" | "verifying" | "opening";
+  type DownloadProgressEvent = {
+    downloadId: string;
+    phase: DownloadPhase;
+    received: number;
+    total: number | null;
+  };
   type TrackedSource = {
     id: string;
     repo: string;
@@ -24,6 +34,7 @@
     assetExtension?: string;
     assetArchitecture?: Architecture;
     version: string;
+    releaseDate?: string;
     assetName: string;
     assetUrl: string;
     checkedAt: string;
@@ -33,6 +44,8 @@
     sha256?: string;
     downloadedSha256?: string;
     hashVerified?: boolean;
+    lastKnownInstalledVersion?: string;
+    installedVersionSource?: "detected" | "manual";
   };
 
   const storageKey = "updainium.sources.v1";
@@ -54,6 +67,11 @@
     macos: [".dmg", ".pkg"],
     linux: [".appimage", ".deb", ".rpm"],
   };
+  const osLabels: Record<string, string> = {
+    windows: "Windows",
+    macos: "macOS",
+    linux: "Linux",
+  };
 
   let sources = $state<TrackedSource[]>([]);
   let platform = $state<Platform | null>(null);
@@ -74,8 +92,13 @@
   let appFileDragOver = $state(false);
   let checking = $state<string[]>([]);
   let downloading = $state<string | null>(null);
+  let uninstalling = $state<string | null>(null);
+  let downloadProgress = $state<DownloadProgressEvent | null>(null);
   let installedVersions = $state<Record<string, string | null | undefined>>({});
   let installedCheckErrors = $state<string[]>([]);
+  let snackbarMessage = $state("");
+  let snackbarOpen = $state(false);
+  let snackbarTimer: ReturnType<typeof setTimeout> | undefined;
 
   const visibleSources = $derived(
     sources.filter((source) => source.repo.toLowerCase().includes(filter.trim().toLowerCase())),
@@ -86,6 +109,36 @@
       ? `${platform.os === "macos" ? "macOS" : platform.os} · ${platform.arch}`
       : "Detecting system",
   );
+  const downloadPercent = $derived.by(() => {
+    if (!downloadProgress) return null;
+    if (downloadProgress.phase !== "downloading") return 100;
+    if (downloadProgress.total && downloadProgress.total > 0) {
+      return Math.min(100, Math.round((downloadProgress.received / downloadProgress.total) * 100));
+    }
+    return null;
+  });
+  const downloadStatusLabel = $derived(
+    downloadProgress?.phase === "verifying"
+      ? "Verifying the SHA-256 checksum…"
+      : downloadProgress?.phase === "opening"
+        ? "Opening the installer…"
+        : downloadPercent !== null
+          ? "Downloading"
+          : "Downloading…",
+  );
+  const downloadDetailLabel = $derived.by(() => {
+    if (!downloadProgress) return "";
+    if (downloadProgress.phase === "verifying") {
+      return "The download finished; checking the file against the published checksum.";
+    }
+    if (downloadProgress.phase === "opening") {
+      return "The installer is ready and will now be opened.";
+    }
+    const received = formatBytes(downloadProgress.received);
+    return downloadProgress.total && downloadProgress.total > 0
+      ? `${received} of ${formatBytes(downloadProgress.total)}`
+      : `${received} downloaded · total size unknown`;
+  });
 
   onMount(async () => {
     try {
@@ -102,10 +155,13 @@
               typeof source.url === "string" &&
               (source.appIdentifier === undefined || typeof source.appIdentifier === "string") &&
               typeof source.version === "string" &&
+              (source.releaseDate === undefined || typeof source.releaseDate === "string") &&
               typeof source.assetName === "string" &&
               typeof source.assetUrl === "string" &&
               typeof source.checkedAt === "string" &&
               typeof source.error === "string" &&
+              (source.lastKnownInstalledVersion === undefined || typeof source.lastKnownInstalledVersion === "string") &&
+              (source.installedVersionSource === undefined || source.installedVersionSource === "detected" || source.installedVersionSource === "manual") &&
               (source.sha256 === undefined || typeof source.sha256 === "string") &&
               (source.downloadedSha256 === undefined || typeof source.downloadedSha256 === "string") &&
               (source.hashVerified === undefined || typeof source.hashVerified === "boolean") &&
@@ -174,6 +230,13 @@
 
   function messageOf(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
+  }
+
+  function formatBytes(value: number): string {
+    if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GB`;
+    if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+    if (value >= 1024) return `${(value / 1024).toFixed(1)} kB`;
+    return `${value} B`;
   }
 
   function repositoryFromUrl(input: string): SourceReference {
@@ -309,9 +372,6 @@
                 `${origin}/api/v3/repos/${reference.repositoryPath}/releases/latest`,
                 `${origin}/api/v4/projects/${encodeURIComponent(reference.repositoryPath)}/releases/permalink/latest`,
               ];
-      // Forge APIs do not send `Access-Control-Allow-Origin`, so requesting them
-      // from the WebView fails with "Load failed" even when they are reachable.
-      // The backend fetches instead, where no cross-origin policy applies.
       const release = await invoke<Release>("fetch_release_metadata", { apiUrls });
       const asset = source.assetExtension
         ? assetForExtension(
@@ -326,8 +386,26 @@
           const architectureLabel =
             architectures.find((option) => option.value === architecture)?.label ??
             "this device";
+          const availableExtensions = [
+            ...new Set(
+              (release.assets ?? [])
+                .map((item) => (item.name.match(/\.[^./]+$/)?.[0] ?? "").toLowerCase())
+                .filter(Boolean),
+            ),
+          ].sort();
+          const availableLabel = availableExtensions.length
+            ? ` This release offers: ${availableExtensions.join(", ")}.`
+            : "";
+          const osKey = platform?.os ?? "";
+          const nativeFormat = formats[osKey]?.find((format) =>
+            availableExtensions.includes(format),
+          );
+          const platformHint =
+            osKey && nativeFormat && nativeFormat !== source.assetExtension.toLowerCase()
+              ? ` On ${osLabels[osKey] ?? osKey}, this release ships ${nativeFormat}; try ${nativeFormat} instead.`
+              : "";
           throw new Error(
-            `No release asset ends with ${source.assetExtension} for ${architectureLabel}.`,
+            `No release asset ends with ${source.assetExtension} for ${architectureLabel}.${availableLabel}${platformHint}`,
           );
         }
         const supported = formats[platform.os]?.join(", ") ?? "no compatible formats";
@@ -338,6 +416,7 @@
           ? {
               ...item,
               version: release.tag_name || release.name || "Unversioned release",
+              releaseDate: release.published_at,
               assetName: asset.name,
               assetUrl: asset.browser_download_url,
               sha256: asset.sha256 ?? undefined,
@@ -456,6 +535,8 @@
         assetUrl: "",
         checkedAt: "",
         error: "",
+        lastKnownInstalledVersion: currentSource?.url === repo.url ? currentSource.lastKnownInstalledVersion : undefined,
+        installedVersionSource: currentSource?.url === repo.url ? currentSource.installedVersionSource : undefined,
       };
       if (editingSourceId) {
         const previousSource = sources.find((item) => item.id === editingSourceId);
@@ -485,7 +566,29 @@
       ...sources.map((source) => checkSource(source.id)),
       ...sources.map((source) => checkInstalled(source)),
     ]);
+    const updatesAvailable = sources.some((source) => hasUpdate(source));
+    showSnackbar(updatesAvailable ? "Updates available" : "All your apps are up to date");
   }
+
+  function showSnackbar(message: string, timeout = 5000): void {
+    snackbarMessage = message;
+    snackbarOpen = true;
+    if (snackbarTimer) clearTimeout(snackbarTimer);
+    snackbarTimer = setTimeout(() => {
+      snackbarOpen = false;
+      snackbarTimer = undefined;
+    }, timeout);
+  }
+
+  function hideSnackbar(): void {
+    if (snackbarTimer) clearTimeout(snackbarTimer);
+    snackbarTimer = undefined;
+    snackbarOpen = false;
+  }
+
+  onDestroy(() => {
+    if (snackbarTimer) clearTimeout(snackbarTimer);
+  });
 
   async function refreshSource(source: TrackedSource): Promise<void> {
     await Promise.all([checkSource(source.id), checkInstalled(source)]);
@@ -499,17 +602,138 @@
     }
     installedVersions[source.id] = undefined;
     try {
-      installedVersions[source.id] = await invoke<string | null>("get_installed_app_version", {
+      const installedVersion = await invoke<string | null>("get_installed_app_version", {
         identifier: source.appIdentifier,
       });
+      installedVersions[source.id] = installedVersion;
+      if (installedVersion?.trim()) rememberInstalledVersion(source.id, installedVersion, "detected");
     } catch (error) {
       installedCheckErrors = [...installedCheckErrors, source.id];
       appError = `Could not check whether ${source.repo} is installed: ${messageOf(error)}`;
     }
   }
 
+  function rememberInstalledVersion(
+    sourceId: string,
+    version: string,
+    source: "detected" | "manual",
+  ): void {
+    const normalized = version.trim();
+    if (!normalized) return;
+    sources = sources.map((item) =>
+      item.id === sourceId
+        ? { ...item, lastKnownInstalledVersion: normalized, installedVersionSource: source }
+        : item,
+    );
+  }
+
+  function installedVersionForComparison(source: TrackedSource): string | null {
+    const detected = installedVersions[source.id];
+    if (typeof detected === "string" && detected.trim()) return detected;
+    if (detected === null && source.installedVersionSource !== "manual") return null;
+    return source.lastKnownInstalledVersion ?? null;
+  }
+
+  function installedVersionIsCurrent(source: TrackedSource): boolean {
+    const installed = installedVersionForComparison(source);
+    if (!installed || !source.version) return false;
+    const installedParts = installed.match(/\d+/g)?.map(Number);
+    const latestParts = source.version.match(/\d+/g)?.map(Number);
+    return Boolean(
+      installedParts?.length && latestParts?.length &&
+      Array.from({ length: Math.max(installedParts.length, latestParts.length) }, (_, index) =>
+        (installedParts[index] ?? 0) === (latestParts[index] ?? 0),
+      ).every(Boolean),
+    );
+  }
+
+  function markUpToDate(source: TrackedSource): void {
+    if (!source.version || source.version === "Unversioned release") return;
+    rememberInstalledVersion(source.id, source.version, "manual");
+  }
+
+  function isInstalled(source: TrackedSource): boolean {
+    return Boolean(installedVersionForComparison(source));
+  }
+
+  function operationInFlight(source: TrackedSource): boolean {
+    return downloading === source.id || uninstalling === source.id;
+  }
+
+  function anyOperationInFlight(): boolean {
+    return downloading !== null || uninstalling !== null;
+  }
+
+  function installActionLabel(source: TrackedSource): string {
+    if (uninstalling === source.id) return "Uninstalling…";
+    if (downloading === source.id) return hasUpdate(source) ? "Updating…" : "Installing…";
+    if (installedCheckErrors.includes(source.id)) {
+      if (hasUpdate(source)) return "Update";
+      return isInstalled(source) ? "Uninstall" : "Install";
+    }
+    if (installedVersions[source.id] === undefined) {
+      if (isInstalled(source)) return hasUpdate(source) ? "Update" : "Uninstall";
+      return source.appIdentifier ? "Checking…" : "Install";
+    }
+    if (isInstalled(source)) return hasUpdate(source) ? "Update" : "Uninstall";
+    return "Install";
+  }
+
+  function canInstallOrUpdate(source: TrackedSource): boolean {
+    if (!source.assetUrl || checking.includes(source.id) || anyOperationInFlight()) return false;
+    if (
+      source.appIdentifier && installedVersions[source.id] === undefined &&
+      !source.lastKnownInstalledVersion && !installedCheckErrors.includes(source.id)
+    ) return false;
+    return !(isInstalled(source) && !hasUpdate(source));
+  }
+
+  function canUninstall(source: TrackedSource): boolean {
+    if (!source.appIdentifier || checking.includes(source.id) || anyOperationInFlight()) return false;
+    if (installedCheckErrors.includes(source.id)) return isInstalled(source);
+    if (installedVersions[source.id] === undefined) {
+      return Boolean(source.lastKnownInstalledVersion);
+    }
+    return isInstalled(source);
+  }
+
+  async function runPrimaryAction(source: TrackedSource): Promise<void> {
+    if (isInstalled(source) && !hasUpdate(source)) {
+      await uninstallApp(source);
+    } else {
+      await downloadAndOpen(source);
+    }
+  }
+
+  async function uninstallApp(source: TrackedSource): Promise<void> {
+    if (!canUninstall(source) || !source.appIdentifier) return;
+    const appName = source.repo.split("/").at(-1) ?? source.repo;
+    if (!confirm(`Uninstall ${appName} from this device?`)) return;
+    uninstalling = source.id;
+    sources = sources.map((item) => (item.id === source.id ? { ...item, error: "" } : item));
+    try {
+      await invoke("uninstall_app", { identifier: source.appIdentifier });
+      sources = sources.map((item) =>
+        item.id === source.id
+          ? { ...item, lastKnownInstalledVersion: undefined, installedVersionSource: undefined }
+          : item,
+      );
+      installedVersions[source.id] = undefined;
+      await checkInstalled(source);
+      showSnackbar(`${appName} was uninstalled.`);
+    } catch (error) {
+      sources = sources.map((item) =>
+        item.id === source.id
+          ? { ...item, error: `Could not uninstall the app: ${messageOf(error)}` }
+          : item,
+      );
+    } finally {
+      uninstalling = null;
+    }
+  }
+
   function hasUpdate(source: TrackedSource): boolean {
-    const installedVersion = installedVersions[source.id];
+    const installedVersion = installedVersionForComparison(source);
     if (!installedVersion || !source.version) return false;
     const installedParts = installedVersion.match(/\d+/g)?.map(Number);
     const latestParts = source.version.match(/\d+/g)?.map(Number);
@@ -523,8 +747,10 @@
   }
 
   async function downloadAndOpen(source: TrackedSource): Promise<void> {
-    if (!source.assetUrl || downloading) return;
+    if (!source.assetUrl || downloading || uninstalling) return;
     downloading = source.id;
+    downloadProgress = { downloadId: source.id, phase: "downloading", received: 0, total: null };
+    let unlistenProgress: (() => void) | undefined;
     sources = sources.map((item) =>
       item.id === source.id
         ? {
@@ -537,11 +763,21 @@
         : item,
     );
     try {
+      unlistenProgress = await listen<DownloadProgressEvent>("download-progress", (event) => {
+        if (event.payload.downloadId === source.id) downloadProgress = event.payload;
+      });
       const downloaded = await invoke<{ path: string; sha256: string; verified: boolean }>("download_release_asset", {
         url: source.assetUrl,
         fileName: source.assetName,
         expectedSha256: source.sha256 ?? null,
+        downloadId: source.id,
       });
+      downloadProgress = {
+        downloadId: source.id,
+        phase: "opening",
+        received: downloadProgress?.received ?? 0,
+        total: downloadProgress?.total ?? null,
+      };
       sources = sources.map((item) =>
         item.id === source.id
           ? {
@@ -553,6 +789,7 @@
           : item,
       );
       await openPath(downloaded.path);
+      await checkInstalled(source);
     } catch (error) {
       const verificationFailure = messageOf(error).match(/failed SHA-256 verification\. Expected [a-f0-9]{64}, got ([a-f0-9]{64})\./i);
       if (verificationFailure) {
@@ -570,6 +807,8 @@
         item.id === source.id ? { ...item, error: detail } : item,
       );
     } finally {
+      unlistenProgress?.();
+      downloadProgress = null;
       downloading = null;
     }
   }
@@ -594,15 +833,13 @@
     return true;
   }
 
-  function checkedLabel(value: string): string {
-    if (!value) return "Not checked yet";
-    return new Intl.DateTimeFormat("en", { dateStyle: "medium" }).format(new Date(value));
+  function releaseDateLabel(value?: string): string {
+    if (!value) return "Date unavailable";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "Date unavailable";
+    return new Intl.DateTimeFormat("en", { dateStyle: "medium" }).format(date);
   }
 
-  function checkedDateTime(value: string): string {
-    if (!value) return "Not checked yet";
-    return new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
-  }
 </script>
 
 <svelte:head>
@@ -640,24 +877,6 @@
   </aside>
 
   <main class="main-content">
-    <header class="topbar">
-      <div class="breadcrumb"><span>Library</span><span class="crumb-slash">/</span><strong>Apps</strong></div>
-      <Button
-        class="icon-button refresh-button"
-        variant="text"
-        type="button"
-        aria-label="Check for updates"
-        title="Check for updates"
-        onclick={refreshAll}
-        disabled={!sources.length || checking.length > 0}
-      >
-        <svg class:spinning={checking.length > 0} viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M20 7v5h-5M4 17v-5h5"></path>
-          <path d="M5.6 9a7 7 0 0 1 11.7-2L20 12M4 12l2.7 5a7 7 0 0 0 11.7-2"></path>
-        </svg>
-      </Button>
-    </header>
-
     <section class="content">
       {#if appError}
         <div class="notice error-notice" role="alert">{appError}<button onclick={() => (appError = "")} aria-label="Close">×</button></div>
@@ -670,7 +889,7 @@
         <section class="add-section" aria-labelledby="add-title">
           <div class="add-heading">
             <button class="back-button" type="button" aria-label="Back to apps" onclick={() => { showAddSection = false; editingSourceId = null; }}>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6M9 12h11"></path></svg>
+              <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor" aria-hidden="true"><path d="M640-80 240-480l400-400 71 71-329 329 329 329-71 71Z"/></svg>
             </button>
             <h1 id="add-title">{editingSourceId ? "Edit app" : "Add an app"}</h1>
           </div>
@@ -679,8 +898,8 @@
             <label class="add-field">
               <span class="visually-hidden">Repository URL</span>
               <input bind:value={sourceUrl} placeholder="Source URL of the application" type="url" required />
-              <span class="field-symbol" aria-hidden="true">
-                <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></svg>
+              <span class="field-symbol field-symbol-filled" aria-hidden="true">
+                <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor"><path d="M440-440H200v-80h240v-240h80v240h240v80H520v240h-80v-240Z"/></svg>
               </span>
             </label>
             <div class:app-file-drag-over={appFileDragOver} class="identifier-field-row">
@@ -740,7 +959,7 @@
         <section class="app-detail" aria-labelledby="detail-title">
           <div class="detail-identity">
             <button class="back-button" type="button" aria-label="Back to apps" onclick={() => (selectedSourceId = null)}>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6M9 12h11"></path></svg>
+              <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor" aria-hidden="true"><path d="M640-80 240-480l400-400 71 71-329 329 329 329-71 71Z"/></svg>
             </button>
             <div class="detail-avatar" aria-hidden="true">
               {selectedSource.repo.split("/").at(-1)?.slice(0, 1).toUpperCase() ?? "A"}
@@ -759,16 +978,32 @@
               <div class="detail-section-label">Latest release</div>
               <h2>{selectedSource.version || "Release not checked yet"}</h2>
               <div class="detail-asset">{selectedSource.assetName || `Looking for ${selectedSource.assetExtension || "a release asset"}`}</div>
+              <div class="release-published">Release date: {releaseDateLabel(selectedSource.releaseDate)}</div>
             </div>
+            <div class="installed-version">
+              <span class="detail-section-label">Installed version</span>
+              {#if typeof installedVersions[selectedSource.id] === "string" && installedVersions[selectedSource.id]?.trim()}
+                <strong>{installedVersions[selectedSource.id]}</strong><span class="version-source">Detected on this device</span>
+              {:else if installedVersionForComparison(selectedSource)}
+                <strong>{installedVersionForComparison(selectedSource)}</strong><span class="version-source">Last known</span>
+              {:else if installedVersions[selectedSource.id] === null}
+                <strong>Not detected</strong>
+              {:else}
+                <strong>Unknown</strong>
+              {/if}
+            </div>
+            {#if selectedSource.version && selectedSource.version !== "Unversioned release" && !installedVersionIsCurrent(selectedSource)}
+              <button class="mark-current-button" type="button" onclick={() => markUpToDate(selectedSource)}>
+                Mark as up to date
+              </button>
+              <div class="installed-version-hint">Use this after you finish installing the release.</div>
+            {/if}
             {#if selectedSource.error}
               <p class="detail-error" role="alert">{selectedSource.error}</p>
             {/if}
             {#if selectedSource.downloadPath}
               <button class="reopen-link" type="button" onclick={() => reopenDownloaded(selectedSource)}>Open downloaded file</button>
             {/if}
-          </section>
-          <section class="detail-card checked-card" aria-label="Last checked">
-            Last checked: {checkedDateTime(selectedSource.checkedAt)}
           </section>
           <section class="detail-card hash-card" aria-label="Hash certificate">
             <div class="detail-section-label">Hash certificate (SHA-256)</div>
@@ -801,11 +1036,39 @@
               <div class="detail-extension">Architecture <strong>{architectures.find((architecture) => architecture.value === (selectedSource.assetArchitecture ?? "auto"))?.label ?? "Automatic (this device)"}</strong></div>
             {/if}
             {#if selectedSource.assetUrl}
-              <Button class="detail-download" variant="text" type="button" onclick={() => downloadAndOpen(selectedSource)} disabled={downloading !== null}>
+              {#if downloading === selectedSource.id}
+                <div class="operation-progress">
+                  <div class="operation-progress-row">
+                    <span class="operation-progress-label" role="status" aria-live="polite">{downloadStatusLabel}</span>
+                    {#if downloadPercent !== null}
+                      <span class="operation-progress-percent">{downloadPercent}%</span>
+                    {/if}
+                  </div>
+                  <div
+                    class="operation-progress-track"
+                    role="progressbar"
+                    aria-label={downloadStatusLabel}
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                    aria-valuenow={downloadPercent ?? undefined}
+                  >
+                    {#if downloadPercent !== null}
+                      <span class="operation-progress-fill" style={`width: ${downloadPercent}%`}></span>
+                    {:else}
+                      <span class="linear-progress-bar primary"><span></span></span>
+                      <span class="linear-progress-bar secondary"><span></span></span>
+                    {/if}
+                  </div>
+                  {#if downloadDetailLabel}
+                    <div class="operation-progress-detail">{downloadDetailLabel}</div>
+                  {/if}
+                </div>
+              {/if}
+              <Button class="detail-download" variant="text" type="button" onclick={() => downloadAndOpen(selectedSource)} disabled={downloading !== null || uninstalling !== null}>
                 {#if downloading === selectedSource.id}
-                  <span class="button-spinner"></span>Downloading…
+                  <span class="button-spinner"></span>{downloadStatusLabel}
                 {:else}
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M5 18v3h14v-3"></path></svg>
+                  <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor" aria-hidden="true"><path d="M480-320 280-520l56-58 104 104v-326h80v326l104-104 56 58-200 200ZM240-160q-33 0-56.5-23.5T160-240v-120h80v120h480v-120h80v120q0 33-23.5 56.5T720-160H240Z"/></svg>
                   Download release asset
                 {/if}
               </Button>
@@ -813,34 +1076,24 @@
           </section>
 
           <div class="detail-actions">
-            <button class="detail-icon-button" type="button" aria-label={`Edit ${selectedSource.repo}`} title="Edit app" onclick={() => editSource(selectedSource)} disabled={checking.includes(selectedSource.id) || downloading === selectedSource.id}>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 5 5 5M4 20l4.5-.9L19 8.6a2.1 2.1 0 0 0-3-3L5.5 16.1 4 20Z"></path></svg>
+            <button class="detail-icon-button" type="button" aria-label={`Edit ${selectedSource.repo}`} title="Edit app" onclick={() => editSource(selectedSource)} disabled={checking.includes(selectedSource.id) || operationInFlight(selectedSource)}>
+              <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor" class="detail-icon-filled" aria-hidden="true"><path d="M200-200h57l391-391-57-57-391 391v57Zm-80 80v-170l528-527q12-11 26.5-17t30.5-6q16 0 31 6t26 18l55 56q12 11 17.5 26t5.5 30q0 16-5.5 30.5T817-647L290-120H120Zm640-584-56-56 56 56Zm-141 85-28-29 57 57-29-28Z"/></svg>
             </button>
             <button class="detail-icon-button" type="button" aria-label="Check release again" title="Check release again" onclick={() => refreshSource(selectedSource)} disabled={checking.includes(selectedSource.id)}>
-              <svg class:spinning={checking.includes(selectedSource.id)} viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"></path><path d="M5.6 9a7 7 0 0 1 11.7-2L20 12M4 12l2.7 5a7 7 0 0 0 11.7-2"></path></svg>
+              <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor" class="detail-icon-filled" class:spinning={checking.includes(selectedSource.id)} aria-hidden="true"><path d="M204-318q-22-38-33-78t-11-82q0-134 93-228t227-94h7l-64-64 56-56 160 160-160 160-56-56 64-64h-7q-100 0-170 70.5T240-478q0 26 6 51t18 49l-60 60ZM481-40 321-200l160-160 56 56-64 64h7q100 0 170-70.5T720-482q0-26-6-51t-18-49l60-60q22 38 33 78t11 82q0 134-93 228t-227 94h-7l64 64-56 56Z"/></svg>
             </button>
             <button class="detail-icon-button" type="button" aria-label={`Remove ${selectedSource.repo}`} title="Remove app" onclick={() => { if (removeSource(selectedSource)) selectedSourceId = null; }}>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6m4-6v6M5 7l1 14h12l1-14M9 7V4h6v3"></path></svg>
+              <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor" class="detail-icon-filled" aria-hidden="true"><path d="M280-120q-33 0-56.5-23.5T200-200v-520h-40v-80h200v-40h240v40h200v80h-40v520q0 33-23.5 56.5T680-120H280Zm400-600H280v520h400v-520ZM360-280h80v-360h-80v360Zm160 0h80v-360h-80v360ZM280-720v520-520Z"/></svg>
             </button>
             <button
               class="detail-install-button"
+              class:destructive={isInstalled(selectedSource) && !hasUpdate(selectedSource)}
               type="button"
-              onclick={() => downloadAndOpen(selectedSource)}
-              disabled={!selectedSource.assetUrl || checking.includes(selectedSource.id) || downloading !== null || (Boolean(selectedSource.appIdentifier) && (installedVersions[selectedSource.id] === undefined || (installedVersions[selectedSource.id] !== null && !hasUpdate(selectedSource))))}
+              onclick={() => runPrimaryAction(selectedSource)}
+              disabled={!canInstallOrUpdate(selectedSource) && !canUninstall(selectedSource)}
             >
-              {#if downloading === selectedSource.id}
-                Downloading…
-              {:else if !selectedSource.appIdentifier}
-                Install
-              {:else if installedCheckErrors.includes(selectedSource.id)}
-                Unavailable
-              {:else if installedVersions[selectedSource.id] === undefined}
-                Checking…
-              {:else if installedVersions[selectedSource.id] === null}
-                Install
-              {:else}
-                Update
-              {/if}
+              {#if uninstalling === selectedSource.id}<span class="button-spinner"></span>{/if}
+              {installActionLabel(selectedSource)}
             </button>
           </div>
         </section>
@@ -850,13 +1103,22 @@
           <h1>Apps</h1>
         </div>
         <div class="heading-actions">
+          <Button
+            class="icon-button refresh-button"
+            variant="text"
+            type="button"
+            aria-label="Check for updates"
+            title="Check for updates"
+            onclick={refreshAll}
+            disabled={!sources.length || checking.length > 0}
+          >
+            <svg class:spinning={checking.length > 0} xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor" aria-hidden="true"><path d="M204-318q-22-38-33-78t-11-82q0-134 93-228t227-94h7l-64-64 56-56 160 160-160 160-56-56 64-64h-7q-100 0-170 70.5T240-478q0 26 6 51t18 49l-60 60ZM481-40 321-200l160-160 56 56-64 64h7q100 0 170-70.5T720-482q0-26-6-51t-18-49l60-60q22 38 33 78t11 82q0 134-93 228t-227 94h-7l64 64-56 56Z"/></svg>
+          </Button>
           <a class="settings-button" href="/settings" aria-label="Settings" title="Settings">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M19.14 12.94a7.49 7.49 0 0 0 .05-1.88l2.03-1.58-2-3.46-2.4.97a7.28 7.28 0 0 0-1.63-.95L14.82 3h-4l-.37 3.04a7.28 7.28 0 0 0-1.63.95l-2.4-.97-2 3.46 2.03 1.58a7.49 7.49 0 0 0 0 1.88l-2.03 1.58 2 3.46 2.4-.97a7.28 7.28 0 0 0 1.63.95L10.82 21h4l.37-3.04a7.28 7.28 0 0 0 1.63-.95l2.4.97 2-3.46-2.08-1.58ZM12.82 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"></path>
-            </svg>
+            <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor" aria-hidden="true"><path d="m370-80-16-128q-13-5-24.5-12T307-235l-119 50L78-375l103-78q-1-7-1-13.5v-27q0-6.5 1-13.5L78-585l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5v27q0 6.5-2 13.5l103 78-110 190-118-50q-11 8-23 15t-24 12L590-80H370Zm70-80h79l14-106q31-8 57.5-23.5T639-327l99 41 39-68-86-65q5-14 7-29.5t2-31.5q0-16-2-31.5t-7-29.5l86-65-39-68-99 42q-22-23-48.5-38.5T533-694l-13-106h-79l-14 106q-31 8-57.5 23.5T321-633l-99-41-39 68 86 64q-5 15-7 30t-2 32q0 16 2 31t7 30l-86 65 39 68 99-42q22 23 48.5 38.5T427-266l13 106Zm42-180q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Zm-2-140Z"/></svg>
           </a>
           <Button class="primary-button add-button" variant="unelevated" type="button" onclick={() => { editingSourceId = null; sourceAppIdentifier = ""; showAddSection = true; }}>
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>
+            <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor" aria-hidden="true"><path d="M440-440H200v-80h240v-240h80v240h240v80H520v240h-80v-240Z"/></svg>
             Add
           </Button>
         </div>
@@ -889,6 +1151,12 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg>
           <input bind:value={filter} placeholder="Search" aria-label="Search apps" />
         </label>
+        {#if checking.length > 0}
+          <span class="linear-progress" role="progressbar" aria-label="Checking for updates">
+            <span class="linear-progress-bar primary"><span></span></span>
+            <span class="linear-progress-bar secondary"><span></span></span>
+          </span>
+        {/if}
       </div>
 
       {#if !sources.length}
@@ -908,15 +1176,18 @@
                     {#if source.iconUrl}
                       <img src={source.iconUrl} alt="" onerror={(event) => event.currentTarget.setAttribute("hidden", "")} />
                     {/if}
+                    {#if source.error}<span class="avatar-error-badge" title={source.error}></span>{/if}
                   </span>
                   <span class="app-details">
-                    <span class="app-title-row"><span class="app-name">{source.repo.split("/").at(-1)}</span></span>
+                    <span class="app-title-row">
+                      <span class="app-name">{source.repo.split("/").at(-1)}</span>
+                      {#if hasUpdate(source)}<span class="update-badge">Update available</span>{/if}
+                    </span>
                     <span class="repo-link">by {source.repo.split("/").slice(0, -1).join("/")}</span>
-                    {#if source.error}<span class="source-error">{source.error}</span>{/if}
                   </span>
                   <span class="release-summary">
                     {#if source.version}<span class="release-version">{source.version}</span>{/if}
-                    {#if source.checkedAt}<span class="release-date">{checkedLabel(source.checkedAt)}</span>{/if}
+                    <span class="release-date" title="Latest release date">{releaseDateLabel(source.releaseDate)}</span>
                   </span>
                 </button>
               </article>
@@ -927,6 +1198,18 @@
       {/if}
     </section>
   </main>
+
+  {#if snackbarOpen}
+    <div
+      class="snackbar"
+      role="status"
+      aria-live="polite"
+      transition:fly={{ y: 16, duration: 200 }}
+    >
+      <span class="snackbar-label">{snackbarMessage}</span>
+      <button class="snackbar-action" type="button" onclick={hideSnackbar}>Dismiss</button>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -983,6 +1266,11 @@
   .notice { position: relative; margin: 0 0 20px; padding: 12px 40px 12px 14px; border-radius: 8px; line-height: 1.5; }
   .error-notice { border: 1px solid #f2d5d5; background: #fff5f4; color: #a03e3a; }
   .notice button { position: absolute; top: 4px; right: 10px; border: 0; background: none; color: inherit; font-size: 21px; cursor: pointer; }
+  .snackbar { position: fixed; right: 0; bottom: 24px; left: 0; z-index: 60; display: flex; width: fit-content; max-width: min(560px, calc(100vw - 40px)); min-height: 48px; align-items: center; gap: 8px; margin: 0 auto; padding: 12px 10px 12px 18px; border-radius: 10px; background: #2f2b36; box-shadow: 0 8px 24px rgb(24 19 32 / 28%); color: #f4f1f8; font-size: 13px; line-height: 1.45; }
+  .snackbar-label { min-width: 0; }
+  .snackbar-action { flex: 0 0 auto; padding: 8px 14px; border: 0; border-radius: 7px; background: transparent; color: #d2b7ff; font-size: 12px; font-weight: 650; cursor: pointer; transition: background .15s ease; }
+  .snackbar-action:hover { background: rgb(255 255 255 / 10%); }
+  .snackbar-action:focus-visible { outline: 2px solid #d2b7ff; outline-offset: 2px; }
   .page-heading { display: flex; align-items: end; justify-content: space-between; gap: 24px; }
   .heading-actions { display: flex; align-items: center; gap: 8px; }
   .settings-button { display: grid; width: 40px; height: 40px; place-items: center; border: 0; border-radius: 50%; background: transparent; color: var(--accent); transition: color .16s ease; }
@@ -1007,10 +1295,60 @@
   .summary-label { color: #898894; font-size: 11px; }
   .summary-card strong { overflow: hidden; color: #33323e; font-size: 17px; font-weight: 690; letter-spacing: -.35px; text-overflow: ellipsis; white-space: nowrap; }
   .platform-summary strong { font-size: 12px; }
-  .list-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin: 38px 0 13px; }
+  .list-heading { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 18px; margin: 38px 0 13px; }
   .list-heading > div { display: flex; align-items: baseline; gap: 10px; }
   h2 { margin: 0; color: #302f3b; font-size: 15px; font-weight: 690; letter-spacing: -.2px; }
   .list-count { color: #a09faa; font-size: 11px; }
+  /* Material linear progress indicator (indeterminate) shown while a check for updates is running. */
+  .linear-progress {
+    position: absolute;
+    right: 0;
+    bottom: -9px;
+    left: 0;
+    height: 4px;
+    overflow: hidden;
+    border-radius: 4px;
+    background: var(--surface-muted);
+  }
+  .linear-progress-bar { position: absolute; top: 0; width: 100%; height: 100%; transform-origin: top left; }
+  .linear-progress-bar > span { display: block; width: 100%; height: 100%; border-radius: 4px; background: var(--accent, #705394); }
+  .linear-progress-bar.primary { left: -145.166611%; animation: linear-progress-primary-translate 2s infinite linear; }
+  .linear-progress-bar.primary > span { animation: linear-progress-primary-scale 2s infinite linear; }
+  .linear-progress-bar.secondary { left: -54.888891%; animation: linear-progress-secondary-translate 2s infinite linear; }
+  .linear-progress-bar.secondary > span { animation: linear-progress-secondary-scale 2s infinite linear; }
+  @keyframes linear-progress-primary-translate {
+    0% { transform: translateX(0); }
+    20% { animation-timing-function: cubic-bezier(.5, 0, .701732, .495819); transform: translateX(0); }
+    59.15% { animation-timing-function: cubic-bezier(.302435, .381352, .55, .956352); transform: translateX(83.67142%); }
+    100% { transform: translateX(200.611057%); }
+  }
+  @keyframes linear-progress-primary-scale {
+    0% { transform: scaleX(.08); }
+    36.65% { animation-timing-function: cubic-bezier(.334731, .12482, .785844, 1); transform: scaleX(.08); }
+    69.15% { animation-timing-function: cubic-bezier(.06, .11, .6, 1); transform: scaleX(.661479); }
+    100% { transform: scaleX(.08); }
+  }
+  @keyframes linear-progress-secondary-translate {
+    0% { animation-timing-function: cubic-bezier(.15, 0, .515058, .409685); transform: translateX(0); }
+    25% { animation-timing-function: cubic-bezier(.31033, .284058, .8, .733712); transform: translateX(37.651913%); }
+    48.35% { animation-timing-function: cubic-bezier(.4, .627035, .6, .902026); transform: translateX(84.386165%); }
+    100% { transform: translateX(160.277782%); }
+  }
+  @keyframes linear-progress-secondary-scale {
+    0% { animation-timing-function: cubic-bezier(.205028, .057051, .57661, .453971); transform: scaleX(.08); }
+    19.15% { animation-timing-function: cubic-bezier(.152313, .196432, .648374, 1.004315); transform: scaleX(.457104); }
+    44.15% { animation-timing-function: cubic-bezier(.257759, -.003163, .211762, 1.38179); transform: scaleX(.72796); }
+    100% { transform: scaleX(.08); }
+  }
+  /* Download/install/update progress in the source card; determinate when the
+     server publishes a total size, indeterminate otherwise. */
+  .operation-progress { display: grid; gap: 7px; margin-top: 14px; }
+  .operation-progress-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .operation-progress-label { color: var(--text, #24212a); font-size: 13px; font-weight: 560; }
+  .operation-progress-percent { color: var(--accent-strong, #60427f); font-size: 13px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .operation-progress-track { position: relative; height: 6px; overflow: hidden; border-radius: 4px; background: var(--surface-muted, #eee7f0); }
+  .operation-progress-fill { display: block; height: 100%; border-radius: inherit; background: var(--accent, #705394); transition: width .18s ease; }
+  .operation-progress-detail { color: var(--muted, #56515d); font-size: 12px; }
   .search-box { display: flex; width: 232px; height: 34px; align-items: center; gap: 8px; padding: 0 9px; border: 1px solid #e9e8ef; border-radius: 6px; background: #fff; color: #a1a0ad; }
   .search-box svg { width: 15px; height: 15px; flex: 0 0 auto; }
   .search-box input { width: 100%; min-width: 0; border: 0; outline: none; background: transparent; color: #454451; font-size: 11px; }
@@ -1021,25 +1359,29 @@
   .app-card-content { display: flex; min-height: inherit; align-items: center; gap: 15px; padding: 17px 16px; }
   .app-open-button { display: flex; min-width: 0; flex: 1; align-items: center; gap: 15px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
   .app-open-button:focus-visible { outline: 2px solid var(--accent, #705394); outline-offset: 4px; border-radius: 8px; }
-  .app-avatar { position: relative; display: grid; width: 43px; height: 43px; flex: 0 0 auto; place-items: center; border: 1px solid #e5e1fb; border-radius: 12px; background: linear-gradient(145deg, #f5f2ff, #e9e4ff); color: #725bd8; font-size: 19px; font-weight: 700; }
-  .app-avatar.has-icon { border: 0; border-radius: 0; background: transparent; }
-  .app-avatar img { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 0; object-fit: contain; }
+  .app-avatar { position: relative; display: grid; width: 43px; height: 43px; flex: 0 0 auto; place-items: center; border: 1px solid #e5e1fb; border-radius: 21px; background: linear-gradient(145deg, #f5f2ff, #e9e4ff); color: #725bd8; font-size: 19px; font-weight: 700; }
+  .app-avatar.has-icon { border: 0; border-radius: 21px; background: transparent; }
+  .app-avatar img { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 21px; object-fit: contain; }
   .detail-avatar img { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: inherit; object-fit: cover; }
   .app-details { min-width: 0; flex: 1; }
   .app-title-row { display: flex; align-items: center; gap: 9px; }
+  .update-badge { display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 999px; background: color-mix(in srgb, var(--accent, #705394) 15%, transparent); color: var(--accent-strong, #60427f); font-size: 10px; font-weight: 650; line-height: 1.2; white-space: nowrap; }
   .app-name { overflow: hidden; margin: 0; color: #34333f; font-size: 14px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
   .app-name { display: block; }
   .repo-link { display: inline-block; max-width: 100%; overflow: hidden; margin-top: 4px; color: #8c8a98; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-  .source-error { margin: 9px 0 0; color: #b84b48; font-size: 11px; line-height: 1.45; }
+  .avatar-error-badge { position: absolute; top: -3px; right: -3px; width: 11px; height: 11px; border: 2px solid #fff; border-radius: 50%; background: #b84b48; }
   .reopen-link { margin-top: 5px; padding: 0; border: 0; background: none; color: #6951da; font-size: 11px; cursor: pointer; text-decoration: underline; }
   :global(.icon-button) { display: grid; width: 34px; height: 34px; min-width: 0; flex: 0 0 auto; place-items: center; padding: 0; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #858391; cursor: pointer; }
   :global(.icon-button:hover) { border-color: #e9e7f1; background: #f8f7fb; color: #6650d1; }
   :global(.icon-button:disabled) { opacity: .45; cursor: wait; }
   :global(.icon-button svg) { width: 16px; height: 16px; }
-  :global(.refresh-button svg) { width: 17px; height: 17px; }
+  :global(.refresh-button svg) { width: 21px; height: 21px; fill: currentColor; stroke: none; }
   .spinning { animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .button-spinner { width: 12px; height: 12px; border: 2px solid rgb(255 255 255 / 40%); border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
+  :global(.icon-button.refresh-button) { display: flex; width: 40px; height: 40px; min-width: 0; align-items: center; justify-content: center; gap: 0; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--accent); font-size: 12px; white-space: nowrap; transition: color .16s ease; }
+  :global(.icon-button.refresh-button:hover) { background: transparent; color: var(--accent-strong, var(--accent)); }
+  :global(.icon-button.refresh-button:disabled) { opacity: .55; }
   .empty-state { display: flex; min-height: 358px; flex-direction: column; align-items: center; justify-content: center; padding: 35px; border: 1px dashed #e5e3ed; border-radius: 10px; background: #fff; text-align: center; }
   .empty-state > p { max-width: 410px; margin: 9px 0 19px; color: #8c8a97; font-size: 12px; line-height: 1.65; }
   .empty-filter { padding: 43px 16px; border: 1px solid #eeedf3; border-radius: 8px; background: #fff; color: #8c8a97; text-align: center; font-size: 12px; }
@@ -1049,7 +1391,7 @@
   .back-button { display: grid; width: 38px; height: 38px; flex: 0 0 auto; place-items: center; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--text, #24212a); cursor: pointer; transition: background .16s ease, transform .16s ease; }
   .back-button:hover { background: var(--surface-muted, #eee7f0); }
   .back-button:active { transform: translateX(-2px); }
-  .back-button svg { width: 23px; height: 23px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .back-button svg { width: 23px; height: 23px; fill: currentColor; stroke: none; }
   .add-intro { margin: 10px 0 26px 53px; color: var(--muted, #56515d); font-size: 14px; }
   .add-form { display: grid; gap: 14px; }
   .identifier-field-row { display: flex; align-items: center; gap: 12px; }
@@ -1064,6 +1406,7 @@
   .add-field select { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text, #24212a); font-size: 17px; }
   .field-symbol { display: grid; width: 30px; height: 30px; flex: 0 0 auto; place-items: center; color: var(--muted, #56515d); opacity: .8; }
   .field-symbol svg { width: 23px; height: 23px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .field-symbol-filled svg { fill: currentColor; stroke: none; }
   .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }
   .form-error { margin: 8px 0 0; color: #b84b48; font-size: 11px; }
   .add-hint { margin: 2px 6px; color: var(--muted, #56515d); font-size: 12px; line-height: 1.55; }
@@ -1081,35 +1424,51 @@
   .detail-section-label { margin-bottom: 8px; color: var(--subtle, #817b87); font-size: 12px; }
   .detail-release h2 { margin: 0; color: var(--text, #24212a); font-size: 20px; font-weight: 500; }
   .detail-asset { margin-top: 7px; color: var(--muted, #56515d); font-size: 14px; overflow-wrap: anywhere; }
+  .release-published { margin-top: 7px; color: var(--subtle, #817b87); font-size: 12px; }
+  .installed-version { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px; margin-top: 17px; color: var(--text, #24212a); font-size: 13px; }
+  .installed-version .detail-section-label { flex-basis: 100%; margin: 0; }
+  .installed-version strong { font-weight: 550; }
+  .version-source { color: var(--subtle, #817b87); font-size: 11px; }
+  .mark-current-button { margin-top: 13px; padding: 7px 12px; border: 1px solid var(--border, #e9e0ec); border-radius: 16px; background: var(--surface-raised, #fffaff); color: var(--accent-strong, #60427f); font-size: 12px; cursor: pointer; }
+  .mark-current-button:hover { background: var(--surface-muted, #eee7f0); }
+  .installed-version-hint { margin-top: 6px; color: var(--subtle, #817b87); font-size: 11px; }
   .detail-error { margin: 12px 0 0; color: #b84b48; font-size: 12px; line-height: 1.5; }
   .release-card .reopen-link { margin-top: 7px; }
-  .checked-card { padding: 20px 24px; color: var(--muted, #56515d); font-size: 14px; }
   .hash-card { padding: 20px 24px; }
   .hash-label { margin-top: 10px; color: var(--muted, #56515d); font-size: 12px; }
   .hash-value { display: block; margin-top: 4px; color: var(--text, #24212a); font-family: "Roboto Mono", monospace; font-size: 12px; overflow-wrap: anywhere; user-select: all; }
   .hash-status { margin-top: 12px; color: var(--muted, #56515d); font-size: 12px; line-height: 1.5; }
   .hash-status.hash-failed { color: #b84b48; }
-  .source-card { padding: 19px 24px 0; }
+  .source-card { padding: 19px 24px; }
   .detail-repository { display: block; overflow-wrap: anywhere; color: var(--text, #24212a); font-size: 15px; font-style: italic; text-decoration: underline; text-underline-offset: 3px; }
   .detail-extension { margin-top: 9px; color: var(--muted, #56515d); font-size: 14px; }
   .detail-extension strong { display: block; margin-top: 4px; color: var(--text, #24212a); font-weight: 450; overflow-wrap: anywhere; }
-  :global(.detail-download) { display: flex; width: calc(100% + 48px); min-height: 58px; margin: 19px -24px 0; align-items: center; justify-content: center; gap: 10px; border: 0; border-top: 1px solid color-mix(in srgb, var(--border, #e9e0ec) 60%, transparent); border-radius: 0; background: color-mix(in srgb, var(--surface) 72%, var(--surface-raised)); color: var(--accent-strong, #60427f); font-size: 15px; transition: background .16s ease; }
+  :global(.detail-download) { display: flex; width: calc(100% + 48px); min-height: 58px; margin: 19px -24px -19px; align-items: center; justify-content: center; gap: 10px; border: 0; border-top: 1px solid color-mix(in srgb, var(--border, #e9e0ec) 60%, transparent); border-radius: 0; background: color-mix(in srgb, var(--surface) 72%, var(--surface-raised)); color: var(--accent-strong, #60427f); font-size: 15px; transition: background .16s ease; }
   :global(.detail-download:hover) { background: var(--surface-muted, #eee7f0); }
-  :global(.detail-download svg) { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  :global(.detail-download svg) { width: 19px; height: 19px; fill: currentColor; stroke: none; }
   :global(.detail-download:disabled) { opacity: .65; cursor: wait; }
   .detail-actions { display: flex; gap: 10px; margin-top: 18px; padding: 20px 22px; border-radius: 22px; background: var(--surface, #f7f0f8); }
-  .detail-install-button { min-width: 104px; margin-left: auto; padding: 0 22px; border: 0; border-radius: 22px; background: #e9dcff; color: #4e3973; font-size: 15px; cursor: pointer; }
+  .detail-install-button { min-width: 104px; margin-left: auto; padding: 0 22px; border: 0; border-radius: 22px; background: #e9dcff; color: #4e3973; font-size: 15px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
   .detail-install-button:hover:not(:disabled) { background: #ddcaff; }
   .detail-install-button:disabled { opacity: .48; cursor: not-allowed; }
+  .detail-install-button.destructive { background: #fbdcdc; color: #8a2b2b; }
+  .detail-install-button.destructive:hover:not(:disabled) { background: #f6c9c9; }
+  .detail-install-button .button-spinner { border-color: rgb(78 57 115 / 30%); border-top-color: #4e3973; }
   .detail-icon-button { display: grid; width: 44px; height: 44px; place-items: center; border: 1px solid var(--border, #e9e0ec); border-radius: 50%; background: var(--surface-raised, #fffaff); color: var(--muted, #56515d); cursor: pointer; transition: background .16s ease, color .16s ease, transform .16s ease; }
   .detail-icon-button:hover { background: var(--surface-muted, #eee7f0); color: var(--accent, #705394); }
   .detail-icon-button:active { transform: scale(.96); }
   .detail-icon-button:disabled { opacity: .5; cursor: wait; }
   .detail-icon-button svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .detail-icon-button svg.detail-icon-filled { fill: currentColor; stroke: none; }
   @keyframes section-enter { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
   @media (prefers-reduced-motion: reduce) {
     .add-section, .app-detail { animation: none; }
     .back-button, .add-field, .back-link, .detail-icon-button, :global(.detail-download) { transition: none; }
+    .operation-progress-fill { transition: none; }
+    .linear-progress-bar, .linear-progress-bar > span { animation: none; }
+    .linear-progress-bar.primary { left: 0; }
+    .linear-progress-bar.primary > span { transform: none; }
+    .linear-progress-bar.secondary { display: none; }
   }
   @media (max-width: 1020px) {
     .sidebar { width: 210px; }
@@ -1140,7 +1499,7 @@
     .search-box { width: 100%; }
     .app-card-content { align-items: flex-start; gap: 10px; padding: 13px 11px; }
     .app-open-button { gap: 10px; }
-    .app-avatar { width: 36px; height: 36px; border-radius: 10px; font-size: 16px; }
+    .app-avatar { width: 36px; height: 36px; border-radius: 21px; font-size: 16px; }
     .app-title-row { flex-wrap: wrap; gap: 5px; }
     .app-name { font-size: 12px; }
   }
@@ -1381,7 +1740,7 @@
     font-weight: 400;
   }
   :global(.primary-button.add-button:hover) { background: #dfcefb; }
-  :global(.primary-button.add-button svg) { width: 25px; height: 25px; }
+  :global(.primary-button.add-button svg) { width: 25px; height: 25px; fill: currentColor; stroke: none; }
   .empty-state { min-height: 150px; justify-content: center; border: 0; border-radius: 24px; background: var(--surface); }
   .empty-state > p { margin: 0; color: var(--muted); font-size: 15px; }
   .empty-filter { border: 0; border-radius: 24px; background: var(--surface); color: var(--muted); }
@@ -1399,6 +1758,9 @@
     }
     .detail-install-button { background: #503d70; color: #f2e9ff; }
     .detail-install-button:hover:not(:disabled) { background: #624b88; }
+    .detail-install-button.destructive { background: #6e3232; color: #ffdede; }
+    .detail-install-button.destructive:hover:not(:disabled) { background: #824040; }
+    .detail-install-button .button-spinner { border-color: rgb(242 233 255 / 30%); border-top-color: #f2e9ff; }
     :global(.primary-button.add-button) { background: #503d70; color: #f2e9ff; }
     :global(.primary-button.add-button:hover) { background: #624b88; }
   }
@@ -1434,8 +1796,7 @@
     .detail-card { margin-top: 14px; border-radius: 22px; }
     .release-card { padding: 21px 19px; }
     .detail-release h2 { font-size: 18px; }
-    .detail-asset, .checked-card, .detail-extension { font-size: 13px; }
-    .checked-card { padding: 19px; }
+    .detail-asset, .detail-extension { font-size: 13px; }
     .source-card { padding: 19px 19px 0; }
     .detail-repository { font-size: 14px; }
     :global(.detail-download) { width: calc(100% + 38px); min-height: 58px; margin-right: -19px; margin-left: -19px; font-size: 14px; }
