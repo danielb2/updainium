@@ -276,25 +276,28 @@ fn client() -> Result<Client, String> {
 
 struct ApiResponse {
     value: Value,
-    etag: Option<String>,
 }
 
 async fn response_json(response: reqwest::Response) -> Result<ApiResponse, String> {
     let status = response.status();
     if !status.is_success() {
+        let message = response
+            .text()
+            .await
+            .ok()
+            .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+            .and_then(|body| body["message"].as_str().map(str::to_owned));
         return Err(match status.as_u16() {
             401 => "GitHub credentials expired or are invalid. Sign in again.".into(),
             403 => "GitHub denied this request. Check gist permissions or try again after the rate limit resets.".into(),
             404 => "GitHub could not find this gist or you do not have access.".into(),
             412 => "This backup changed on GitHub since you reviewed it. Refresh and review the latest update before uploading.".into(),
-            _ => format!("GitHub request failed (HTTP {status})."),
+            _ => match message {
+                Some(message) => format!("GitHub request failed (HTTP {status}): {message}"),
+                None => format!("GitHub request failed (HTTP {status})."),
+            },
         });
     }
-    let etag = response
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
     let mut response = response;
     let mut bytes = Vec::new();
     while let Some(chunk) = response
@@ -309,7 +312,7 @@ async fn response_json(response: reqwest::Response) -> Result<ApiResponse, Strin
     }
     let value = serde_json::from_slice(&bytes)
         .map_err(|_| "GitHub returned an unreadable response.".to_owned())?;
-    Ok(ApiResponse { value, etag })
+    Ok(ApiResponse { value })
 }
 
 async fn api(
@@ -318,17 +321,16 @@ async fn api(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, String> {
-    api_conditional(token, method, path, body, None)
+    api_request(token, method, path, body)
         .await
         .map(|response| response.value)
 }
 
-async fn api_conditional(
+async fn api_request(
     token: &str,
     method: Method,
     path: &str,
     body: Option<Value>,
-    if_match: Option<&str>,
 ) -> Result<ApiResponse, String> {
     let mut request = client()?
         .request(method, format!("https://api.github.com{path}"))
@@ -339,9 +341,6 @@ async fn api_conditional(
     }
     if let Some(body) = body {
         request = request.json(&body);
-    }
-    if let Some(if_match) = if_match {
-        request = request.header(reqwest::header::IF_MATCH, if_match);
     }
     response_json(
         request
@@ -744,7 +743,7 @@ pub async fn github_write_backup(
                 .as_deref()
                 .ok_or("Review the latest backup before updating it.")?;
             let existing =
-                api_conditional(&token, Method::GET, &format!("/gists/{id}"), None, None).await?;
+                api_request(&token, Method::GET, &format!("/gists/{id}"), None).await?;
             verify_revision(&existing.value, expected)?;
             if !existing.value["files"][FILE_NAME].is_object() {
                 return Err("This gist is not an Updainium backup.".into());
@@ -752,15 +751,11 @@ pub async fn github_write_backup(
             if existing.value["owner"]["login"].as_str() != Some(login(&state)?.as_str()) {
                 return Err("You can only update your own backup gists.".into());
             }
-            let etag = existing
-                .etag
-                .ok_or("GitHub did not return the current backup revision.")?;
-            let updated = api_conditional(
+            let updated = api_request(
                 &token,
                 Method::PATCH,
                 &format!("/gists/{id}"),
                 Some(body),
-                Some(&etag),
             )
             .await?;
             verify_no_interleaving(&updated.value, expected)?;
